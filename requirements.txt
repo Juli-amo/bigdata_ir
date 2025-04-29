@@ -1,0 +1,8 @@
+pandas==1.5.3
+numpy==1.24.2
+matplotlib==3.7.1
+scikit-learn==1.2.2
+seaborn==0.12.2
+jupyter==1.0.0
+pyarrow==11.0.0
+pyspark==3.4.1
