@@ -1,0 +1,80 @@
+# Python Bytecode Files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/C++ compiled files
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+sdist/
+develop-eggs/
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Installer logs and local caches
+pip-log.txt
+pip-delete-this-directory.txt
+.cache/
+.coverage
+
+# Unit test / coverage results
+htmlcov/
+.tox/
+.nox/
+pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE and editor directories
+.idea/
+.vscode/
+*.code-workspace
+.spyproject
+.ropeproject
+
+# Local configuration
+*.env
+*.env.*
+
+# System-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails and temporary files
+._*
+Thumbs.db
+Desktop.ini
+
+# Data files (large datasets, model checkpoints)
+*.npy
+*.npz
+*.h5
+*.pkl
+*.pickle
+*.db
+*.sqlite
+*.pt
+*.ckpt
+dataset/
+data/
+images/
+Bilder/
+old/
+
+# Ignore generated documentation
+docs/_build/
