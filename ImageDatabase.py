@@ -1,16 +1,15 @@
-import sqlite3
-import os
-import hashlib
-import json
+import sqlite3, os, json, hashlib, datetime
 from pathlib import Path
-from typing import Generator, List, Dict, Optional, Tuple
+from typing import Generator, List, Dict, Optional, Tuple, Any
 import cv2
 import numpy as np
-from datetime import datetime
 import logging
 
+from FeatureExtraction import ColorAnalyzer, compute_phash, ImageFeatureExtractor
+logger = logging.getLogger("ImageDatabase")
+
 # Import der eigenen Feature Extraction
-from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor
+# from FeatureExtraction import ColorAnalyzer, 
 
 
 class ImageDatabase:
@@ -27,6 +26,11 @@ class ImageDatabase:
             db_path (str): Pfad zur SQLite Datenbank
         """
         self.db_path = db_path
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.commit()
         self.color_analyzer = ColorAnalyzer()
         self.feature_extractor = ImageFeatureExtractor()
         
@@ -40,52 +44,65 @@ class ImageDatabase:
     
     def _create_tables(self):
         """Erstellt die benötigten Tabellen"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            # Haupttabelle für Image Metadaten
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS images (
-                    image_id TEXT PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    filepath TEXT NOT NULL,
-                    file_size INTEGER,
-                    width INTEGER,
-                    height INTEGER,
-                    channels INTEGER,
-                    file_hash TEXT UNIQUE,
-                    photographer TEXT,
-                    created_date TEXT,
-                    added_to_db TEXT,
-                    UNIQUE(filepath)
-                )
-            """)
+        #with sqlite3.connect(self.db_path) as conn:
+            #cursor = conn.cursor()
+        cursor = self.conn.cursor()
+        # Haupttabelle für Image Metadaten
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS images (
+                image_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                filepath TEXT NOT NULL,
+                file_size INTEGER,
+                width INTEGER,
+                height INTEGER,
+                channels INTEGER,
+                file_hash TEXT UNIQUE,
+                photographer TEXT,
+                created_date TEXT,
+                added_to_db TEXT,
+                UNIQUE(filepath)
+             )
+        """)    
             
             # Tabelle für Color Features (von ColorAnalyzer)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS color_features (
-                    image_id TEXT PRIMARY KEY,
-                    dominant_colors TEXT,  -- JSON serialized
-                    hsv_histogram TEXT,    -- JSON serialized
-                    bgr_histogram TEXT,    -- JSON serialized
-                    color_stats TEXT,      -- JSON serialized (mean, std, etc.)
-                    FOREIGN KEY (image_id) REFERENCES images (image_id)
-                )
-            """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS color_features (
+                image_id TEXT PRIMARY KEY,
+                dominant_colors TEXT,  -- JSON serialized
+                hsv_histogram TEXT,    -- JSON serialized
+                bgr_histogram TEXT,    -- JSON serialized
+                color_stats TEXT,      -- JSON serialized (mean, std, etc.)
+                FOREIGN KEY (image_id) REFERENCES images (image_id)
+            )
+        """)
             
-            # Tabelle für zusätzliche Features (für Texture, Deep Learning Embeddings, etc.)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS advanced_features (
-                    image_id TEXT PRIMARY KEY,
-                    texture_features TEXT,     -- JSON serialized
-                    deep_embeddings TEXT,      -- JSON serialized (für später)
-                    custom_features TEXT,      -- JSON serialized
-                    FOREIGN KEY (image_id) REFERENCES images (image_id)
-                )
-            """)
+        # Tabelle für zusätzliche Features (für Texture, Deep Learning Embeddings, etc.)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS advanced_features (
+                image_id TEXT PRIMARY KEY,
+                texture_features TEXT,     -- JSON serialized
+                deep_embeddings TEXT,      -- JSON serialized (für später)
+                custom_features TEXT,      -- JSON serialized
+                FOREIGN KEY (image_id) REFERENCES images (image_id)
+            )
+        """)
             
-            conn.commit()
-            self.logger.info("Database Tabellen erstellt/überprüft")
+        #conn.commit()
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_path ON images(filepath);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_hash ON images(file_hash);")
+        self.conn.commit()
+        self.logger.info("Database Tabellen erstellt/überprüft")
+
+    def _now_iso(self) -> str:
+        return datetime.datetime.now().isoformat(timespec="seconds")
+
+    def _file_hash(self, path: str, block_size: int = 1 << 20) -> str:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(block_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
     
     def generate_image_id(self, filepath: str) -> str:
         """
@@ -120,9 +137,11 @@ class ImageDatabase:
                 raise ValueError(f"Kann Bild nicht laden: {filepath}")
             
             # File Hash für Duplikatserkennung
-            with open(filepath, 'rb') as f:
-                file_hash = hashlib.md5(f.read()).hexdigest()
-            
+            #with open(filepath, 'rb') as f:
+                #file_hash = hashlib.md5(f.read()).hexdigest()
+
+            file_hash = self._file_hash(filepath)
+
             metadata = {
                 'filename': os.path.basename(filepath),
                 'filepath': os.path.abspath(filepath),
@@ -132,8 +151,10 @@ class ImageDatabase:
                 'channels': image.shape[2] if len(image.shape) == 3 else 1,
                 'file_hash': file_hash,
                 'photographer': None,
-                'created_date': datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
-                'added_to_db': datetime.now().isoformat()
+                #'created_date': datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+                #'added_to_db': datetime.now().isoformat()
+                'created_date': datetime.datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+                'added_to_db': datetime.datetime.now().isoformat()
             }
             
             return metadata
@@ -217,8 +238,96 @@ class ImageDatabase:
             self.logger.error(f"Fehler beim Extrahieren von Advanced Features für {image_id}: {e}")
             return None
     
-    def add_image(self, filepath: str) -> Optional[str]:
+    def add_image(self, path: str) -> Optional[str]:
         """
+        Insert/Upsert an image:
+        - read metadata
+        - compute & persist color features (histograms + dominant colors + stats)
+        - compute & persist pHash in advanced_features.custom_features
+        Returns image_id (str) or None on failure.
+        """
+        try:
+            path = os.path.abspath(path)
+            if not os.path.exists(path):
+                logger.warning(f"Path does not exist: {path}")
+                return None
+
+            img = cv2.imread(path)
+            if img is None:
+                logger.warning(f"Cannot read image: {path}")
+                return None
+
+            # --- metadata ---
+            st = os.stat(path)
+            h, w = img.shape[:2]
+            ch = 1 if img.ndim == 2 else img.shape[2]
+            fhash = self._file_hash(path)
+            fname = os.path.basename(path)
+            cur = self.conn.cursor()
+            cur.execute("SELECT image_id FROM images WHERE filepath=? OR file_hash=?", (path, fhash))
+            row = cur.fetchone()
+            if row:
+                image_id = row[0]
+            else:
+                image_id = fhash[:16]  # stable short id
+            # image_id = fhash[:16]  # stable short id
+
+            cur = self.conn.cursor()
+
+            # images (UPSERT by image_id)
+            cur.execute("""
+            INSERT INTO images (image_id, filename, filepath, file_size, width, height, channels, file_hash, photographer, created_date, added_to_db)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                filename=excluded.filename,
+                filepath=excluded.filepath,
+                file_size=excluded.file_size,
+                width=excluded.width,
+                height=excluded.height,
+                channels=excluded.channels,
+                file_hash=excluded.file_hash
+            """, (image_id, fname, path, int(st.st_size), int(w), int(h), int(ch), fhash, self._now_iso(), self._now_iso()))
+
+            # --- color features (32 Bins, 3 dominants) ---
+            ca = ColorAnalyzer(k_clusters=3, random_state=42)
+            cf = ca.extract_color_features(img, num_bins=32, num_dominant=3)
+
+            cur.execute("""
+            INSERT INTO color_features (image_id, dominant_colors, hsv_histogram, bgr_histogram, color_stats)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                dominant_colors=excluded.dominant_colors,
+                hsv_histogram=excluded.hsv_histogram,
+                bgr_histogram=excluded.bgr_histogram,
+                color_stats=excluded.color_stats
+            """, (image_id,
+                    json.dumps(cf["dominant_colors"]),
+                    json.dumps(cf["hsv_histogram"]),
+                    json.dumps(cf["bgr_histogram"]),
+                    json.dumps(cf["color_stats"])) )
+
+            # --- pHash als "custom_features" ablegen ---
+            ph = compute_phash(img)
+            custom = {"phash_hex": hex(ph)}
+            cur.execute("""
+            INSERT INTO advanced_features (image_id, texture_features, deep_embeddings, custom_features)
+            VALUES (?, NULL, NULL, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                custom_features=excluded.custom_features
+            """, (image_id, json.dumps(custom)))
+
+            self.conn.commit()
+            return image_id
+
+        except Exception as e:
+            logger.error(f"add_image failed for {path}: {e}")
+            self.conn.rollback()
+            return None
+    
+    
+    """
+    def add_image(self, filepath: str) -> Optional[str]:
+        ""
         Fügt ein Bild zur Datenbank hinzu
         
         Args:
@@ -226,7 +335,7 @@ class ImageDatabase:
             
         Returns:
             Optional[str]: Image ID wenn erfolgreich, None sonst
-        """
+        ""
         try:
             # Image ID generieren
             image_id = self.generate_image_id(filepath)
@@ -256,12 +365,12 @@ class ImageDatabase:
                 cursor = conn.cursor()
                 
                 # Image Metadaten speichern
-                cursor.execute("""
+                cursor.execute(""
                     INSERT INTO images (image_id, filename, filepath, file_size, 
                                       width, height, channels, file_hash, 
                                       photographer, created_date, added_to_db)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (image_id, metadata['filename'], metadata['filepath'],
+                "", (image_id, metadata['filename'], metadata['filepath'],
                      metadata['file_size'], metadata['width'], metadata['height'],
                      metadata['channels'], metadata['file_hash'], 
                      metadata['photographer'], metadata['created_date'],
@@ -269,22 +378,22 @@ class ImageDatabase:
                 
                 # Color Features speichern
                 if color_features:
-                    cursor.execute("""
+                    cursor.execute(""
                         INSERT INTO color_features (image_id, dominant_colors, 
                                                    hsv_histogram, bgr_histogram, color_stats)
                         VALUES (?, ?, ?, ?, ?)
-                    """, (image_id, json.dumps(color_features['dominant_colors']),
+                    "", (image_id, json.dumps(color_features['dominant_colors']),
                          json.dumps(color_features['hsv_histogram']),
                          json.dumps(color_features['bgr_histogram']),
                          json.dumps(color_features['color_stats'])))
                 
                 # Advanced Features speichern
                 if advanced_features:
-                    cursor.execute("""
+                    cursor.execute(""
                         INSERT INTO advanced_features (image_id, texture_features, 
                                                      deep_embeddings, custom_features)
                         VALUES (?, ?, ?, ?)
-                    """, (image_id, json.dumps(advanced_features['texture_features']),
+                    "", (image_id, json.dumps(advanced_features['texture_features']),
                          json.dumps(advanced_features['deep_embeddings']),
                          json.dumps(advanced_features['custom_features'])))
                 
@@ -296,7 +405,7 @@ class ImageDatabase:
         except Exception as e:
             self.logger.error(f"Fehler beim Hinzufügen von Bild {filepath}: {e}")
             return None
-    
+    """
     def image_exists(self, image_id: str) -> bool:
         """Prüft ob Bild bereits in DB existiert"""
         with sqlite3.connect(self.db_path) as conn:
@@ -327,6 +436,24 @@ class ImageDatabase:
                     'color_stats': json.loads(row[4])
                 }
             return None
+        
+    def get_custom_features(self, image_id: str) -> Optional[Dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT custom_features FROM advanced_features WHERE image_id = ?", (image_id,))
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
+
+    def get_all_images(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT image_id, filename, filepath FROM images")
+            return [{"image_id": r[0], "filename": r[1], "filepath": r[2]} for r in cursor.fetchall()]
     
     def get_all_image_ids(self) -> List[str]:
         """Holt alle Image IDs aus der Datenbank"""
@@ -451,7 +578,7 @@ def initialize_database_with_images(image_directory: str, db_path: str = "image_
     loader = ImageLoader(db)
     
     # Bilder hinzufügen
-    stats = loader.bulk_add_directory(image_directory)
+    #stats = loader.bulk_add_directory(image_directory)
     
     print(f"Datenbank initialisiert!")
     print(f"Hinzugefügt: {stats['added']}, Übersprungen: {stats['skipped']}, Fehler: {stats['errors']}")

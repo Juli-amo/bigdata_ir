@@ -1,8 +1,9 @@
+import os
+from typing import Dict, Any, List, Optional
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
-
 
 class ColorAnalyzer:
     """
@@ -20,8 +21,9 @@ class ColorAnalyzer:
         self.k_clusters = k_clusters
         self.random_state = random_state
     
-    def color_histogram_similarity(self, image1, image2, method=cv2.HISTCMP_CORREL, 
-                                 color_space='HSV', show_plots=False):
+    def color_histogram_similarity(self, image1, image2, color_space='HSV', num_bins=32,
+                               use_opencv=False,
+                               show_plots=False):
         """
         Berechnet die Ähnlichkeit zwischen zwei Bildern basierend auf Farbhistogrammen
         
@@ -38,7 +40,46 @@ class ColorAnalyzer:
         # Farbraumkonvertierung
         img1, img2 = self._convert_color_space(image1, image2, color_space)
         channels = self._get_channel_names(color_space)
-        
+        # Kanal-Ranges bestimmen
+        if color_space.upper() == 'HSV':
+            ranges = [180, 256, 256]  # H,S,V
+        else:  # BGR
+            ranges = [256, 256, 256]
+
+        hists1, hists2, sims = [], [], []
+
+        if show_plots:
+            plt.figure(figsize=(12, 6))
+
+        for i, ch_name in enumerate(channels):
+            h1 = self._calculate_normalized_histogram(img1, i, num_bins=num_bins, range_max=ranges[i])
+            h2 = self._calculate_normalized_histogram(img2, i, num_bins=num_bins, range_max=ranges[i])
+            hists1.append(h1); hists2.append(h2)
+
+            if use_opencv:
+                # OpenCV Korrelation ([-1,1]) -> auf [0,1] abbilden
+                sim_raw = cv2.compareHist(h1.astype("float32"), h2.astype("float32"), cv2.HISTCMP_CORREL)
+                sim = max(0.0, min(1.0, (sim_raw + 1.0) * 0.5))
+            else:
+                # Cosine-Similarity
+                num = float(np.dot(h1, h2))
+                den = float(np.linalg.norm(h1) * np.linalg.norm(h2) + 1e-8)
+                sim = max(0.0, min(1.0, num / den))
+            sims.append(sim)
+
+            if show_plots:
+                plt.subplot(2, 3, i + 1)
+                plt.plot(h1, label=f'{ch_name} Bild 1', alpha=0.7)
+                plt.plot(h2, label=f'{ch_name} Bild 2', alpha=0.7)
+                plt.title(f'Kanal: {ch_name}')
+                plt.legend(); plt.grid(True, alpha=0.3)
+
+        if show_plots:
+            lt.tight_layout(); plt.show()
+
+        return float(np.mean(sims))
+
+        """
         similarities = []
         
         if show_plots:
@@ -64,8 +105,45 @@ class ColorAnalyzer:
         # Gesamtähnlichkeit als Mittelwert
         overall_similarity = np.mean(similarities)
         return max(0.0, min(1.0, overall_similarity))
+        """
     
-    def get_dominant_colors(self, image):
+    def get_dominant_colors(self, image, max_samples: int = 10000):
+        """
+        Dominante Farben via k-means (auf Lab für bessere Wahrnehmungsnähe),
+        Sampling für Speed, Rückgabe als BGR-Farben (k x 3, dtype float32).
+        """
+        if image is None:
+            raise ValueError("get_dominant_colors: image is None")
+
+        # BGR -> Lab (k-means in Lab ist stabiler bzgl. Wahrnehmung)
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype("float32")
+
+        # Sampling
+        n = lab.shape[0]
+        if n > max_samples:
+            idx = np.random.RandomState(self.random_state).choice(n, size=max_samples, replace=False)
+            lab_sample = lab[idx]
+        else:
+            lab_sample = lab
+
+        K = int(self.k_clusters)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+        _compactness, _labels, centers_lab = cv2.kmeans(
+            lab_sample, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+        )  # (K,3) in Lab
+
+        # Lab -> BGR zum Anzeigen/Weiterverwenden
+        centers_lab_u8 = np.clip(centers_lab, 0, 255).astype("uint8").reshape(-1, 1, 3)
+        centers_bgr = cv2.cvtColor(centers_lab_u8, cv2.COLOR_LAB2BGR).reshape(K, 3).astype("float32")
+
+        # nach Helligkeit sortieren (Summe der Kanäle als einfache Helligkeit)
+        order = np.argsort(centers_bgr.sum(axis=1))
+        return centers_bgr[order]
+
+
+
+
+    def get_dominant_colorsv2(self, image):
         """
         Extrahiert dominante Farben aus einem Bild mit K-Means
         
@@ -163,10 +241,11 @@ class ColorAnalyzer:
         """Gibt die Kanalnamen für den Farbraum zurück"""
         return ['H', 'S', 'V'] if color_space.upper() == 'HSV' else ['B', 'G', 'R']
     
-    def _calculate_normalized_histogram(self, image, channel):
-        """Berechnet normalisiertes Histogramm für einen Kanal"""
-        hist = cv2.calcHist([image], [channel], None, [256], [0, 256])
-        return cv2.normalize(hist, hist).flatten()
+    def _calculate_normalized_histogram(self, image, channel, num_bins=32, range_max=256):
+        """Berechnet L1-normalisiertes Histogramm für einen Kanal mit frei wählbarer Binzahl/Range."""
+        hist = cv2.calcHist([image], [channel], None, [num_bins], [0, range_max]).astype("float32")
+        s = float(hist.sum()) + 1e-8
+        return (hist / s).flatten()
     
     def _plot_histogram(self, hist1, hist2, channel_name, subplot_index):
         """Plottet Histogramm für einen Kanal"""
@@ -176,6 +255,64 @@ class ColorAnalyzer:
         plt.title(f'Kanal: {channel_name}')
         plt.legend()
         plt.grid(True, alpha=0.3)
+
+    def extract_color_features(self, image, num_bins: int = 32, num_dominant: int = None):
+        """
+        Returns dict with:
+          - dominant_colors: list[[B,G,R], ...]
+          - hsv_histogram: [H_bins, S_bins, V_bins] (each normalized)
+            - bgr_histogram: [B_bins, G_bins, R_bins] (each normalized)
+            - color_stats: {"brightness": mean(V), "mean_bgr": [...], "std_bgr":[...]}
+        """
+
+        if image is None:
+            raise ValueError("image is None")
+
+        # ensure 3-channel BGR
+        if len(image.shape) == 2 or (len(image.shape) == 3 and image.shape[2] == 1):
+            bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:
+            bgr = image
+
+        def _norm(h):
+            s = float(h.sum()) + 1e-8
+            return (h / s).flatten().tolist()
+
+        # BGR hists
+        b = cv2.calcHist([bgr],[0],None,[num_bins],[0,256]).astype("float32")
+        g = cv2.calcHist([bgr],[1],None,[num_bins],[0,256]).astype("float32")
+        r = cv2.calcHist([bgr],[2],None,[num_bins],[0,256]).astype("float32")
+        bgr_hist = [_norm(b), _norm(g), _norm(r)]
+
+        # HSV hists
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        h = cv2.calcHist([hsv],[0],None,[num_bins],[0,180]).astype("float32")
+        s = cv2.calcHist([hsv],[1],None,[num_bins],[0,256]).astype("float32")
+        v = cv2.calcHist([hsv],[2],None,[num_bins],[0,256]).astype("float32")
+        hsv_hist = [_norm(h), _norm(s), _norm(v)]
+
+        # stats
+        brightness = float(hsv[:,:,2].mean())
+        mean_bgr = [float(bgr[:,:,c].mean()) for c in range(3)]
+        std_bgr  = [float(bgr[:,:,c].std()) for c in range(3)]
+        stats = {"brightness": brightness, "mean_bgr": mean_bgr, "std_bgr": std_bgr}
+
+        # k-means dominant colors
+        px = bgr.reshape(-1,3).astype("float32")
+        max_samples= 10000
+        if px.shape[0] > max_samples:
+            step=int(np.ceil(px.shape[0]/max_samples)); px=px[::step]
+        K=max(1,int(num_dominant))
+        crit=(cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER,20,1.0)
+        _comp,_lab,centers = cv2.kmeans(px,K,None,crit,5,cv2.KMEANS_PP_CENTERS)
+        centers = centers.clip(0,255).astype("int32").tolist()
+
+        return {
+            "dominant_colors": centers,
+            "hsv_histogram": hsv_hist,
+            "bgr_histogram": bgr_hist,
+            "color_stats": stats,
+        }
 
 
 class ImageFeatureExtractor:
@@ -206,27 +343,40 @@ class ImageFeatureExtractor:
         
         return vector_lists
     
-    def extract_texture_features(self, image):
+    
+    def extract_texture_features(self, image, num_bins: int = 32):
         """
-        Extrahiert Textur-Features aus einem Bild
-        
-        Args:
-            image (np.array): Input-Bild
-            
-        Returns:
-            dict: Dictionary mit Textur-Features
+        Einfache, aber nützliche Texturfeatures:
+        - Gradienten-Magnitude-Histogramm (Sobel)
+        - Laplacian-Varianz (Kanten/Fokus)
+        - Entropie (Grauwertverteilung)
+        + klassische mean/std/var (Kompatibilität)
         """
-        # Konvertierung zu Graustufen
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Beispiel-Features (können erweitert werden)
-        features = {
-            'mean': np.mean(gray),
-            'std': np.std(gray),
-            'variance': np.var(gray)
+        if image is None:
+            raise ValueError("image is None")
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        t_hist = cv2.calcHist([mag], [0], None, [num_bins], [0, 255]).astype("float32")
+        t_hist = (t_hist / (t_hist.sum() + 1e-8)).flatten().tolist()
+
+        lap = cv2.Laplacian(gray, cv2.CV_32F)
+        lap_var = float(lap.var())
+
+        h = cv2.calcHist([gray], [0], None, [256], [0, 256]).astype("float32").flatten()
+        p = h / (h.sum() + 1e-8)
+        entropy = float(-np.sum(np.where(p > 0, p * np.log2(p), 0.0)))
+
+        return {
+            'mean': float(np.mean(gray)),
+            'std': float(np.std(gray)),
+            'variance': float(np.var(gray)),
+            'texture_hist': t_hist,
+            'lap_var': lap_var,
+            'entropy': entropy
         }
-        
-        return features
     
     def calculate_similarity_score(self, image1, image2, method='histogram', **kwargs):
         """
@@ -253,3 +403,26 @@ class ImageFeatureExtractor:
             return max(0.0, similarity)
         else:
             raise ValueError(f"Unbekannte Methode: {method}")
+
+
+def compute_phash(image: np.ndarray, hash_size: int = 8, highfreq_factor: int = 4) -> int:
+    """
+    Perceptual hash (64-bit): to gray -> resize -> DCT -> take top-left block -> threshold by median -> pack bits.
+    Returns integer hash (nutze hex() für Speicherung als String).
+    """
+    if image is None:
+        raise ValueError("compute_phash: image is None")
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    size = hash_size * highfreq_factor
+    gray = cv2.resize(gray, (size, size), interpolation=cv2.INTER_LINEAR).astype("float32")
+    dct = cv2.dct(gray)
+    low = dct[:hash_size, :hash_size]
+    med = float(np.median(low))
+    bits = (low > med).astype(np.uint8).flatten()
+    h = 0
+    for b in bits:
+        h = (h << 1) | int(b)
+    return int(h)

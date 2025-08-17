@@ -1,9 +1,6 @@
 """
 Image Recommender - Hauptklasse für Big Data Image Recommender
 Orchestriert alle Komponenten und erfüllt Projektanforderungen
-
-Autor: Julia & Partnerin
-Kurs: DAISY Big Data Engineering
 """
 
 import numpy as np
@@ -18,8 +15,12 @@ from sklearn.preprocessing import StandardScaler
 import sqlite3
 
 # Eigene Module importieren
-from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor
+from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor, compute_phash
 from ImageDatabase import ImageDatabase, ImageLoader
+
+logger = logging.getLogger("ImageRecommender")
+logging.basicConfig(level=logging.INFO)
+
 
 
 class SimilarityCalculator:
@@ -32,7 +33,48 @@ class SimilarityCalculator:
         self.color_analyzer = ColorAnalyzer()
         self.feature_extractor = ImageFeatureExtractor()
         self.logger = logging.getLogger(__name__)
-    
+
+    def _cosine(self, a, b) -> float:
+        a = np.asarray(a, dtype=np.float32).ravel()
+        b = np.asarray(b, dtype=np.float32).ravel()
+        na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))
+        if na == 0.0 or nb == 0.0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+
+    def _phash_sim(self, hex1: Optional[str], hex2: Optional[str], bits: int = 64) -> float:
+        """Robuste Ähnlichkeit aus pHash (int oder '0x..' String). Gibt 0.0 zurück, wenn etwas fehlt/kaputt ist."""
+        try:
+            import numpy as np
+
+            def _to_int(x):
+                if x is None:
+                    return None
+                # bereits int?
+                if isinstance(x, (int, np.integer)):
+                    return int(x)
+                # String?
+                if isinstance(x, str):
+                    s = x.strip().lower()
+                    if s.startswith("0x"):
+                        s = s[2:]
+                    # nur echte Hex-Zeichen zulassen
+                    if not s or any(c not in "0123456789abcdef" for c in s):
+                        return None
+                    return int(s, 16)
+                return None
+
+            a = _to_int(hex1)
+            b = _to_int(hex2)
+            if a is None or b is None:
+                return 0.0
+
+            x = a ^ b
+            dist = x.bit_count() if hasattr(int, "bit_count") else bin(x).count("1")
+            return max(0.0, 1.0 - dist / float(bits))
+        except Exception:
+            return 0.0
+        
     def calculate_color_similarity(self, features1: Dict, features2: Dict) -> float:
         """
         1. Pflicht-Similarity: Color-based (nutzt deine ColorAnalyzer Klasse)
@@ -44,6 +86,42 @@ class SimilarityCalculator:
         Returns:
             float: Color Similarity Score (0-1, höher = ähnlicher)
         """
+        try:
+            # Histogramme (ohne Annahmen über Bin-Anzahl)
+            hsv1 = np.array(features1['hsv_histogram']).flatten()
+            hsv2 = np.array(features2['hsv_histogram']).flatten()
+            bgr1 = np.array(features1['bgr_histogram']).flatten()
+            bgr2 = np.array(features2['bgr_histogram']).flatten()
+
+            hsv_sim = self._cosine(hsv1, hsv2)            # 0..1
+            bgr_sim = self._cosine(bgr1, bgr2)            # 0..1
+
+            # Helligkeit (0..1)
+            bright1 = float(features1['color_stats']['brightness'])
+            bright2 = float(features2['color_stats']['brightness'])
+            bright_sim = max(0.0, 1.0 - abs(bright1 - bright2) / 255.0)
+
+            # Gewichtete Mischung (Dominant-Color-Teil lassen wir weg – Histos sind robuster)
+            final_sim = 0.45 * hsv_sim + 0.45 * bgr_sim + 0.10 * bright_sim
+
+            return float(min(1.0, max(0.0, final_sim)))
+        except Exception as e:
+            self.logger.error(f"Fehler bei Color Similarity: {e}")
+            return 0.0
+
+
+    """
+    def calculate_color_similarity(self, features1: Dict, features2: Dict) -> float:
+        ""
+        1. Pflicht-Similarity: Color-based (nutzt deine ColorAnalyzer Klasse)
+        
+        Args:
+            features1 (Dict): Color Features von Bild 1
+            features2 (Dict): Color Features von Bild 2
+            
+        Returns:
+            float: Color Similarity Score (0-1, höher = ähnlicher)
+        ""
         try:
             # Dominante Farben Similarity
             colors1 = np.array(features1['dominant_colors'])
@@ -72,6 +150,7 @@ class SimilarityCalculator:
         except Exception as e:
             self.logger.error(f"Fehler bei Color Similarity: {e}")
             return 0.0
+        """
     
     def calculate_embedding_similarity(self, features1: Dict, features2: Dict) -> float:
         """
@@ -109,10 +188,56 @@ class SimilarityCalculator:
         except Exception as e:
             self.logger.error(f"Fehler bei Embedding Similarity: {e}")
             return 0.0
-    
+        
     def calculate_custom_similarity(self, features1: Dict, features2: Dict, 
-                                  color_features1: Dict, color_features2: Dict) -> float:
-        """
+                                  color_features1: Dict, color_features2: Dict, 
+                                  phash_hex1: Optional[str] = None, 
+                                  phash_hex2: Optional[str] = None) -> float:  
+        try:
+            # Varianz-Ähnlichkeit der BGR-Std
+            var1 = np.array(color_features1['color_stats']['std_bgr'], dtype=np.float32)
+            var2 = np.array(color_features2['color_stats']['std_bgr'], dtype=np.float32)
+            var_sim = 1.0 - np.linalg.norm(var1 - var2) / (255.0 * np.sqrt(3.0))
+            var_sim = float(min(1.0, max(0.0, var_sim)))
+
+            # Entropie-Ähnlichkeit (Gleichmäßigkeit der BGR-Verteilung)
+            def _entropy(hist_list):
+                h = np.concatenate(hist_list).astype(np.float32)
+                h = h / (h.sum() + 1e-8)
+                return float(-np.sum(np.where(h > 0, h * np.log(h + 1e-8), 0.0)))
+            entropy1 = _entropy(color_features1['bgr_histogram'])
+            entropy2 = _entropy(color_features2['bgr_histogram'])
+            entropy_sim = 1.0 - abs(entropy1 - entropy2) / max(entropy1, entropy2, 1.0)
+            entropy_sim = float(min(1.0, max(0.0, entropy_sim)))
+
+            # Texture-Komplexität (falls vorhanden)
+            texture1 = (features1 or {}).get('texture_features') or {}
+            texture2 = (features2 or {}).get('texture_features') or {}
+            if texture1 and texture2:
+                c1 = float(texture1.get('std', 0.0)) / (float(texture1.get('mean', 1.0)) + 1.0)
+                c2 = float(texture2.get('std', 0.0)) / (float(texture2.get('mean', 1.0)) + 1.0)
+                complexity_sim = 1.0 - abs(c1 - c2)
+                complexity_sim = float(min(1.0, max(0.0, complexity_sim)))
+            else:
+                complexity_sim = 0.5  # neutral
+
+            # pHash-Ähnlichkeit (robust gegen fehlende Werte)
+            phash_sim = self._cosine([0, 1], [0, 1]) * 0.0  # dummy init
+            phash_sim = self._phash_sim(phash_hex1, phash_hex2)
+
+            # Mischung – gib pHash mehr Gewicht (duplikat-/motivnah)
+            final_sim = 0.5 * phash_sim + 0.25 * var_sim + 0.25 * entropy_sim
+            return float(min(1.0, max(0.0, final_sim)))
+        except Exception as e:
+            self.logger.error(f"Fehler bei Custom Similarity: {e}")
+            return 0.0 
+
+    """
+    def calculate_custom_similarity(self, features1: Dict, features2: Dict, 
+                                  color_features1: Dict, color_features2: Dict, 
+                                  phash_hex1: Optional[str] = None, 
+                                  phash_hex2: Optional[str] = None) -> float:
+        ""
         3. Frei wählbare Similarity: Multi-Modal Approach
         Kombiniert verschiedene Aspekte für robuste Ähnlichkeit
         
@@ -122,7 +247,7 @@ class SimilarityCalculator:
             
         Returns:
             float: Custom Similarity Score (0-1)
-        """
+        ""
         try:
             # Aspect 1: Color Variance Similarity
             var1 = np.array(color_features1['color_stats']['std_bgr'])
@@ -162,6 +287,7 @@ class SimilarityCalculator:
         except Exception as e:
             self.logger.error(f"Fehler bei Custom Similarity: {e}")
             return 0.0
+        """
 
 
 class ApproximateNearestNeighbor:
@@ -348,22 +474,35 @@ class ImageRecommender:
             # Features laden
             color_features1 = self.db.get_color_features(image_id1)
             color_features2 = self.db.get_color_features(image_id2)
+            if not color_features1 or not color_features2:
+                return 0.0           
             
             # Advanced Features laden
             with sqlite3.connect(self.db.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT texture_features FROM advanced_features WHERE image_id IN (?, ?)", 
+
+                cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id IN (?, ?)", 
                              (image_id1, image_id2))
-                rows = cursor.fetchall()
+                #rows = cursor.fetchall()
                 
-                advanced_features1 = {'texture_features': json.loads(rows[0][0])} if rows and rows[0][0] else {}
-                advanced_features2 = {'texture_features': json.loads(rows[1][0])} if len(rows) > 1 and rows[1][0] else {}
-            
+                #advanced_features1 = {'texture_features': json.loads(rows[0][0])} if rows and rows[0][0] else {}
+                #advanced_features2 = {'texture_features': json.loads(rows[1][0])} if len(rows) > 1 and rows[1][0] else {}
+                row1 = cursor.fetchone()
+                adv1 = {'texture_features': json.loads(row1[0])} if row1 and row1[0] else {}
+                ph1 = (json.loads(row1[1]).get('phash_hex') if row1 and row1[1] else None)
+
+                cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id = ?", (image_id2,))
+                row2 = cursor.fetchone()
+                adv2 = {'texture_features': json.loads(row2[0])} if row2 and row2[0] else {}
+                ph2 = (json.loads(row2[1]).get('phash_hex') if row2 and row2[1] else None)
+
+
             # Alle 3 Similarity-Measures berechnen
             color_sim = self.similarity_calc.calculate_color_similarity(color_features1, color_features2)
-            embedding_sim = self.similarity_calc.calculate_embedding_similarity(advanced_features1, advanced_features2)
+            embedding_sim = self.similarity_calc.calculate_embedding_similarity(adv1, adv2)
             custom_sim = self.similarity_calc.calculate_custom_similarity(
-                advanced_features1, advanced_features2, color_features1, color_features2
+                adv1, adv2, color_features1, color_features2,
+                phash_hex1=ph1, phash_hex2=ph2
             )
             
             # Gewichtete Kombination
@@ -404,7 +543,12 @@ class ImageRecommender:
             # Features für Query-Bild extrahieren
             query_color_features = self.similarity_calc.color_analyzer.extract_color_features(query_image)
             query_advanced_features = self.similarity_calc.feature_extractor.extract_texture_features(query_image)
-            
+            try:
+                _q = compute_phash(query_image)
+                query_phash_hex = hex(int(_q)) if _q is not None else None
+            except Exception:
+                query_phash_hex = None
+
             # Alle Bilder in DB vergleichen
             all_image_ids = self.db.get_all_image_ids()
             similarities = []
@@ -413,18 +557,36 @@ class ImageRecommender:
                 try:
                     # Features aus DB laden
                     db_color_features = self.db.get_color_features(image_id)
+                    if not db_color_features:
+                        continue
                     
                     with sqlite3.connect(self.db.db_path) as conn:
                         cursor = conn.cursor()
-                        cursor.execute("SELECT texture_features FROM advanced_features WHERE image_id = ?", (image_id,))
+                        cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id = ?", (image_id,))
                         row = cursor.fetchone()
-                        db_advanced_features = {'texture_features': json.loads(row[0])} if row and row[0] else {}
+                        db_advanced_features, db_phash_hex = {}, None
+                        if row:
+                            # texture_features
+                            if row[0]:
+                                try:
+                                    db_advanced_features = {'texture_features': json.loads(row[0])}
+                                except Exception:
+                                    db_advanced_features = {}
+                            # custom_features → pHash
+                            if row[1]:
+                                try:
+                                    cf = json.loads(row[1])
+                                    if isinstance(cf, dict):
+                                        db_phash_hex = cf.get('phash_hex')
+                                except Exception:
+                                    db_phash_hex = None
                     
                     # Similarity berechnen
                     color_sim = self.similarity_calc.calculate_color_similarity(query_color_features, db_color_features)
                     embedding_sim = self.similarity_calc.calculate_embedding_similarity(query_advanced_features, db_advanced_features)
                     custom_sim = self.similarity_calc.calculate_custom_similarity(
-                        query_advanced_features, db_advanced_features, query_color_features, db_color_features
+                        query_advanced_features, db_advanced_features, query_color_features, db_color_features,
+                        phash_hex1=query_phash_hex, phash_hex2=db_phash_hex
                     )
                     
                     # Kombinierte Similarity
