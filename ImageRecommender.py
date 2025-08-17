@@ -1,64 +1,70 @@
-"""
-Image Recommender - Hauptklasse für Big Data Image Recommender
-Orchestriert alle Komponenten und erfüllt Projektanforderungen
-"""
-
-import numpy as np
-import cv2
-import json
-from typing import List, Dict, Tuple, Optional, Union
 import time
+import json
 import logging
-from pathlib import Path
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import StandardScaler
 import sqlite3
+from typing import List, Dict, Tuple, Optional, Union
 
-# Eigene Module importieren
+import cv2
+import numpy as np
+
 from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor, compute_phash
-from ImageDatabase import ImageDatabase, ImageLoader
+from ImageDatabase import ImageDatabase
+from DeepEmbedding import VisionEmbedder
 
-logger = logging.getLogger("ImageRecommender")
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ImageRecommender")
 
+
+def _infer_db_color_params(db_path: str) -> tuple[int, int]:
+    """Read num_bins and k from DB (first row); fallback to (32, 3)."""
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute("SELECT dominant_colors, hsv_histogram FROM color_features LIMIT 1")
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return 32, 3
+        dom = json.loads(row[0])       # list of Kx3
+        hsv = json.loads(row[1])       # [[H],[S],[V]] len=num_bins
+        bins = len(hsv[0]) if isinstance(hsv, list) and hsv and isinstance(hsv[0], list) else 32
+        k = len(dom) if isinstance(dom, list) else 3
+        return int(bins), int(k)
+    except Exception:
+        return 32, 3
 
 
 class SimilarityCalculator:
-    """
-    Implementiert die 3 geforderten Similarity-Measures
-    """
-    
+    """Small collection of similarity functions (color, embedding, custom)."""
+
     def __init__(self):
-        """Initialisiert den Similarity Calculator"""
+        """Init helper feature extractors used for query features."""
         self.color_analyzer = ColorAnalyzer()
         self.feature_extractor = ImageFeatureExtractor()
         self.logger = logging.getLogger(__name__)
 
-    def _cosine(self, a, b) -> float:
+    def _cos(self, a, b) -> float:
+        """Cosine similarity with simple numeric guards."""
         a = np.asarray(a, dtype=np.float32).ravel()
         b = np.asarray(b, dtype=np.float32).ravel()
-        na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
         if na == 0.0 or nb == 0.0:
             return 0.0
         return float(np.dot(a, b) / (na * nb))
 
     def _phash_sim(self, hex1: Optional[str], hex2: Optional[str], bits: int = 64) -> float:
-        """Robuste Ähnlichkeit aus pHash (int oder '0x..' String). Gibt 0.0 zurück, wenn etwas fehlt/kaputt ist."""
+        """Map Hamming distance of 64-bit pHash to [0,1] similarity."""
         try:
-            import numpy as np
-
             def _to_int(x):
                 if x is None:
                     return None
-                # bereits int?
-                if isinstance(x, (int, np.integer)):
+                if isinstance(x, int):
                     return int(x)
-                # String?
                 if isinstance(x, str):
                     s = x.strip().lower()
                     if s.startswith("0x"):
                         s = s[2:]
-                    # nur echte Hex-Zeichen zulassen
                     if not s or any(c not in "0123456789abcdef" for c in s):
                         return None
                     return int(s, 16)
@@ -68,779 +74,567 @@ class SimilarityCalculator:
             b = _to_int(hex2)
             if a is None or b is None:
                 return 0.0
-
             x = a ^ b
             dist = x.bit_count() if hasattr(int, "bit_count") else bin(x).count("1")
             return max(0.0, 1.0 - dist / float(bits))
         except Exception:
             return 0.0
-        
-    def calculate_color_similarity(self, features1: Dict, features2: Dict) -> float:
-        """
-        1. Pflicht-Similarity: Color-based (nutzt deine ColorAnalyzer Klasse)
-        
-        Args:
-            features1 (Dict): Color Features von Bild 1
-            features2 (Dict): Color Features von Bild 2
-            
-        Returns:
-            float: Color Similarity Score (0-1, höher = ähnlicher)
-        """
+
+    def color_sim(self, f1: Dict, f2: Dict) -> float:
+        """Weighted cosine on HSV/BGR histograms + brightness proximity."""
         try:
-            # Histogramme (ohne Annahmen über Bin-Anzahl)
-            hsv1 = np.array(features1['hsv_histogram']).flatten()
-            hsv2 = np.array(features2['hsv_histogram']).flatten()
-            bgr1 = np.array(features1['bgr_histogram']).flatten()
-            bgr2 = np.array(features2['bgr_histogram']).flatten()
+            hsv1 = np.array(f1['hsv_histogram']).flatten()
+            hsv2 = np.array(f2['hsv_histogram']).flatten()
+            bgr1 = np.array(f1['bgr_histogram']).flatten()
+            bgr2 = np.array(f2['bgr_histogram']).flatten()
 
-            hsv_sim = self._cosine(hsv1, hsv2)            # 0..1
-            bgr_sim = self._cosine(bgr1, bgr2)            # 0..1
+            hsv_sim = self._cos(hsv1, hsv2)
+            bgr_sim = self._cos(bgr1, bgr2)
 
-            # Helligkeit (0..1)
-            bright1 = float(features1['color_stats']['brightness'])
-            bright2 = float(features2['color_stats']['brightness'])
+            bright1 = float(f1['color_stats']['brightness'])
+            bright2 = float(f2['color_stats']['brightness'])
             bright_sim = max(0.0, 1.0 - abs(bright1 - bright2) / 255.0)
 
-            # Gewichtete Mischung (Dominant-Color-Teil lassen wir weg – Histos sind robuster)
-            final_sim = 0.45 * hsv_sim + 0.45 * bgr_sim + 0.10 * bright_sim
-
-            return float(min(1.0, max(0.0, final_sim)))
+            s = 0.45 * hsv_sim + 0.45 * bgr_sim + 0.10 * bright_sim
+            return float(min(1.0, max(0.0, s)))
         except Exception as e:
-            self.logger.error(f"Fehler bei Color Similarity: {e}")
+            self.logger.error(f"Color similarity error: {e}")
             return 0.0
 
+    def emb_sim(
+        self,
+        e1: Optional[np.ndarray],
+        e2: Optional[np.ndarray],
+        fallback1: Dict,
+        fallback2: Dict
+    ) -> float:
+        """Cosine on deep embeddings; falls back to simple texture stats."""
+        if e1 is not None and e2 is not None:
+            return float((self._cos(e1, e2) + 1.0) * 0.5)  # [-1,1] → [0,1]
+        t1 = (fallback1 or {}).get('texture_features') or {}
+        t2 = (fallback2 or {}).get('texture_features') or {}
+        if not t1 or not t2:
+            return 0.5
+        v1 = [t1.get('mean', 0), t1.get('std', 0), t1.get('variance', 0)]
+        v2 = [t2.get('mean', 0), t2.get('std', 0), t2.get('variance', 0)]
+        return float((self._cos(v1, v2) + 1.0) * 0.5)
 
-    """
-    def calculate_color_similarity(self, features1: Dict, features2: Dict) -> float:
-        ""
-        1. Pflicht-Similarity: Color-based (nutzt deine ColorAnalyzer Klasse)
-        
-        Args:
-            features1 (Dict): Color Features von Bild 1
-            features2 (Dict): Color Features von Bild 2
-            
-        Returns:
-            float: Color Similarity Score (0-1, höher = ähnlicher)
-        ""
+    def custom_sim(
+        self,
+        adv1: Dict, adv2: Dict,
+        cf1: Dict, cf2: Dict,
+        ph1: Optional[str], ph2: Optional[str]
+    ) -> float:
+        """Blend of pHash similarity, variance similarity, and entropy proximity."""
         try:
-            # Dominante Farben Similarity
-            colors1 = np.array(features1['dominant_colors'])
-            colors2 = np.array(features2['dominant_colors'])
-            color_distance = np.linalg.norm(colors1 - colors2)
-            color_sim = 1 / (1 + color_distance / 100)  # Normalisierung
-            
-            # HSV Histogramm Similarity
-            hist1 = np.array(features1['hsv_histogram']).flatten()
-            hist2 = np.array(features2['hsv_histogram']).flatten()
-            hist_sim = cv2.compareHist(hist1.astype(np.float32), 
-                                     hist2.astype(np.float32), 
-                                     cv2.HISTCMP_CORREL)
-            hist_sim = max(0, hist_sim)  # Negative Werte auf 0 setzen
-            
-            # Brightness Similarity
-            bright1 = features1['color_stats']['brightness']
-            bright2 = features2['color_stats']['brightness']
-            bright_sim = 1 - abs(bright1 - bright2) / 255
-            
-            # Gewichtete Kombination
-            final_sim = 0.4 * color_sim + 0.4 * hist_sim + 0.2 * bright_sim
-            
-            return min(1.0, max(0.0, final_sim))
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei Color Similarity: {e}")
-            return 0.0
-        """
-    
-    def calculate_embedding_similarity(self, features1: Dict, features2: Dict) -> float:
-        """
-        2. Pflicht-Similarity: Deep Learning Embeddings
-        (Aktuell Placeholder - kann später mit echten DL-Embeddings ersetzt werden)
-        
-        Args:
-            features1 (Dict): Advanced Features von Bild 1
-            features2 (Dict): Advanced Features von Bild 2
-            
-        Returns:
-            float: Embedding Similarity Score (0-1)
-        """
-        try:
-            # Für jetzt: Texture-based Pseudo-Embeddings
-            texture1 = features1.get('texture_features', {})
-            texture2 = features2.get('texture_features', {})
-            
-            if not texture1 or not texture2:
-                return 0.5  # Neutral wenn keine Features
-            
-            # Feature-Vektor aus Texture Features erstellen
-            vec1 = [texture1.get('mean', 0), texture1.get('std', 0), texture1.get('variance', 0)]
-            vec2 = [texture2.get('mean', 0), texture2.get('std', 0), texture2.get('variance', 0)]
-            
-            # Cosine Similarity
-            vec1 = np.array(vec1).reshape(1, -1)
-            vec2 = np.array(vec2).reshape(1, -1)
-            
-            similarity = cosine_similarity(vec1, vec2)[0][0]
-            
-            # Normalisierung auf [0, 1]
-            return (similarity + 1) / 2
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei Embedding Similarity: {e}")
-            return 0.0
-        
-    def calculate_custom_similarity(self, features1: Dict, features2: Dict, 
-                                  color_features1: Dict, color_features2: Dict, 
-                                  phash_hex1: Optional[str] = None, 
-                                  phash_hex2: Optional[str] = None) -> float:  
-        try:
-            # Varianz-Ähnlichkeit der BGR-Std
-            var1 = np.array(color_features1['color_stats']['std_bgr'], dtype=np.float32)
-            var2 = np.array(color_features2['color_stats']['std_bgr'], dtype=np.float32)
-            var_sim = 1.0 - np.linalg.norm(var1 - var2) / (255.0 * np.sqrt(3.0))
+            v1 = np.array(cf1['color_stats']['std_bgr'], dtype=np.float32)
+            v2 = np.array(cf2['color_stats']['std_bgr'], dtype=np.float32)
+            var_sim = 1.0 - np.linalg.norm(v1 - v2) / (255.0 * np.sqrt(3.0))
             var_sim = float(min(1.0, max(0.0, var_sim)))
 
-            # Entropie-Ähnlichkeit (Gleichmäßigkeit der BGR-Verteilung)
-            def _entropy(hist_list):
-                h = np.concatenate(hist_list).astype(np.float32)
+            def _ent(hlist):
+                h = np.concatenate(hlist).astype(np.float32)
                 h = h / (h.sum() + 1e-8)
                 return float(-np.sum(np.where(h > 0, h * np.log(h + 1e-8), 0.0)))
-            entropy1 = _entropy(color_features1['bgr_histogram'])
-            entropy2 = _entropy(color_features2['bgr_histogram'])
-            entropy_sim = 1.0 - abs(entropy1 - entropy2) / max(entropy1, entropy2, 1.0)
-            entropy_sim = float(min(1.0, max(0.0, entropy_sim)))
 
-            # Texture-Komplexität (falls vorhanden)
-            texture1 = (features1 or {}).get('texture_features') or {}
-            texture2 = (features2 or {}).get('texture_features') or {}
-            if texture1 and texture2:
-                c1 = float(texture1.get('std', 0.0)) / (float(texture1.get('mean', 1.0)) + 1.0)
-                c2 = float(texture2.get('std', 0.0)) / (float(texture2.get('mean', 1.0)) + 1.0)
-                complexity_sim = 1.0 - abs(c1 - c2)
-                complexity_sim = float(min(1.0, max(0.0, complexity_sim)))
-            else:
-                complexity_sim = 0.5  # neutral
+            e1 = _ent(cf1['bgr_histogram'])
+            e2 = _ent(cf2['bgr_histogram'])
+            ent_sim = 1.0 - abs(e1 - e2) / max(e1, e2, 1.0)
+            ent_sim = float(min(1.0, max(0.0, ent_sim)))
 
-            # pHash-Ähnlichkeit (robust gegen fehlende Werte)
-            phash_sim = self._cosine([0, 1], [0, 1]) * 0.0  # dummy init
-            phash_sim = self._phash_sim(phash_hex1, phash_hex2)
-
-            # Mischung – gib pHash mehr Gewicht (duplikat-/motivnah)
-            final_sim = 0.5 * phash_sim + 0.25 * var_sim + 0.25 * entropy_sim
-            return float(min(1.0, max(0.0, final_sim)))
-        except Exception as e:
-            self.logger.error(f"Fehler bei Custom Similarity: {e}")
-            return 0.0 
-
-    """
-    def calculate_custom_similarity(self, features1: Dict, features2: Dict, 
-                                  color_features1: Dict, color_features2: Dict, 
-                                  phash_hex1: Optional[str] = None, 
-                                  phash_hex2: Optional[str] = None) -> float:
-        ""
-        3. Frei wählbare Similarity: Multi-Modal Approach
-        Kombiniert verschiedene Aspekte für robuste Ähnlichkeit
-        
-        Args:
-            features1/2 (Dict): Advanced Features
-            color_features1/2 (Dict): Color Features
-            
-        Returns:
-            float: Custom Similarity Score (0-1)
-        ""
-        try:
-            # Aspect 1: Color Variance Similarity
-            var1 = np.array(color_features1['color_stats']['std_bgr'])
-            var2 = np.array(color_features2['color_stats']['std_bgr'])
-            var_sim = 1 - np.linalg.norm(var1 - var2) / (255 * np.sqrt(3))
-            
-            # Aspect 2: Texture Complexity Similarity
-            texture1 = features1.get('texture_features', {})
-            texture2 = features2.get('texture_features', {})
-            
-            if texture1 and texture2:
-                complexity1 = texture1.get('std', 0) / (texture1.get('mean', 1) + 1)
-                complexity2 = texture2.get('std', 0) / (texture2.get('mean', 1) + 1)
-                complexity_sim = 1 - abs(complexity1 - complexity2)
-            else:
-                complexity_sim = 0.5
-            
-            # Aspect 3: Color Distribution Uniformity
-            hist1 = np.array(color_features1['bgr_histogram'])
-            hist2 = np.array(color_features2['bgr_histogram'])
-            
-            # Berechne Entropie als Maß für Gleichmäßigkeit
-            def calculate_entropy(hist):
-                hist_flat = np.concatenate(hist)
-                hist_flat = hist_flat + 1e-8  # Avoid log(0)
-                return -np.sum(hist_flat * np.log(hist_flat))
-            
-            entropy1 = calculate_entropy(hist1)
-            entropy2 = calculate_entropy(hist2)
-            entropy_sim = 1 - abs(entropy1 - entropy2) / max(entropy1, entropy2, 1)
-            
-            # Gewichtete Kombination
-            final_sim = 0.4 * var_sim + 0.3 * complexity_sim + 0.3 * entropy_sim
-            
-            return min(1.0, max(0.0, final_sim))
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei Custom Similarity: {e}")
+            ph_sim = self._phash_sim(ph1, ph2)
+            s = 0.5 * ph_sim + 0.25 * var_sim + 0.25 * ent_sim
+            return float(min(1.0, max(0.0, s)))
+        except Exception:
             return 0.0
-        """
 
 
 class ApproximateNearestNeighbor:
     """
-    Implementiert ANN für schnelle Suche (Projektanforderung)
-    Für kleine Datasets: Brute Force, für große: echte ANN-Algorithmen
+    HNSW (hnswlib) with safe fallback to NumPy cosine.
+    - Builds HNSW only if N > use_ann_threshold
+    - Ensures ef_search >= k for queries
     """
-    
-    def __init__(self, use_ann_threshold: int = 1000):
-        """
-        Args:
-            use_ann_threshold (int): Ab dieser Anzahl Bilder echte ANN verwenden
-        """
-        self.use_ann_threshold = use_ann_threshold
-        self.logger = logging.getLogger(__name__)
-    
-    def build_index(self, image_ids: List[str], feature_vectors: List[np.ndarray]):
-        """
-        Baut Index für schnelle Suche auf
-        
-        Args:
-            image_ids (List[str]): Liste der Image IDs
-            feature_vectors (List[np.ndarray]): Feature-Vektoren
-        """
-        self.image_ids = image_ids
-        self.feature_vectors = np.array(feature_vectors)
-        
+
+    def __init__(
+        self,
+        use_ann_threshold: int = 5000,
+        M: int = 16,
+        ef_construction: int = 200,
+        ef_search: int = 200
+    ):
+        """Store HNSW parameters and allocate holders for data/index."""
+        self.use_ann_threshold = int(use_ann_threshold)
+        self.M = int(M)
+        self.ef_construction = int(ef_construction)
+        self.ef_search_default = int(ef_search)
+        self.ef_search_current = int(ef_search)
+
+        self.image_ids: List[str] = []
+        self.X: Optional[np.ndarray] = None
+        self._use_hnsw = False
+        self._norms: Optional[np.ndarray] = None
+        self.name = "cheap"
+        self.ann = None  # hnswlib.Index, if available
+
+    def build(self, image_ids: List[str], X: np.ndarray, name: str):
+        """Build ANN or linear index for the provided vectors."""
+        t0 = time.time()
+        self.name = name
+        self.image_ids = list(image_ids)
+        self.X = np.asarray(X, dtype=np.float32)
+        Xn = self.X / (np.linalg.norm(self.X, axis=1, keepdims=True) + 1e-8)
+
         if len(image_ids) > self.use_ann_threshold:
-            self.logger.info("Große Datenbank - würde echte ANN-Bibliothek verwenden")
-            # Hier könnte FAISS, Annoy, oder ähnliches integriert werden
-            # Für jetzt: Optimierte Brute Force
-        else:
-            self.logger.info(f"Kleine Datenbank ({len(image_ids)} Bilder) - verwende Brute Force")
-    
-    def find_nearest_neighbors(self, query_vector: np.ndarray, k: int = 5) -> List[Tuple[str, float]]:
-        """
-        Findet k ähnlichste Bilder
-        
-        Args:
-            query_vector (np.ndarray): Query Feature-Vektor
-            k (int): Anzahl zu findender Nachbarn
-            
-        Returns:
-            List[Tuple[str, float]]: [(image_id, similarity_score), ...]
-        """
-        if len(self.feature_vectors) == 0:
+            try:
+                import hnswlib
+                dim = int(self.X.shape[1])
+                self.ann = hnswlib.Index(space='cosine', dim=dim)
+                self.ann.init_index(
+                    max_elements=self.X.shape[0],
+                    ef_construction=self.ef_construction,
+                    M=self.M
+                )
+                self.ann.add_items(Xn, np.arange(Xn.shape[0]))
+                self.ann.set_ef(self.ef_search_default)
+                self.ef_search_current = self.ef_search_default
+                self._use_hnsw = True
+                log.info(f"[{name}] hnswlib index built (N={self.X.shape[0]}, d={dim}, "
+                         f"M={self.M}, efC={self.ef_construction}, efS={self.ef_search_current}) "
+                         f"in {time.time()-t0:.2f}s")
+            except Exception as e:
+                self._use_hnsw = False
+                log.warning(f"[{name}] hnswlib unavailable: {e} -> NumPy fallback")
+
+        if not self._use_hnsw:
+            # Precompute norms for fast cosine
+            self._norms = np.linalg.norm(self.X, axis=1).astype(np.float32) + 1e-8
+            log.info(f"[{name}] NumPy-cosine index (N={self.X.shape[0]}) built in {time.time()-t0:.2f}s")
+
+    def knn(self, q: np.ndarray, k: int) -> List[Tuple[str, float]]:
+        """Return top-k (image_id, cosine_sim) for query vector q."""
+        if self.X is None or len(self.image_ids) == 0:
             return []
-        
-        # Cosine Similarity für alle Vektoren berechnen
-        similarities = cosine_similarity([query_vector], self.feature_vectors)[0]
-        
-        # Top-k Indizes finden
-        top_k_indices = np.argsort(similarities)[::-1][:k]
-        
-        # Ergebnisse zusammenstellen
-        results = []
-        for idx in top_k_indices:
-            image_id = self.image_ids[idx]
-            similarity = similarities[idx]
-            results.append((image_id, float(similarity)))
-        
-        return results
+
+        q = np.asarray(q, dtype=np.float32).ravel()
+        N = len(self.image_ids)
+        k = min(max(1, int(k)), N)
+
+        if self._use_hnsw and self.ann is not None:
+            qn = q / (np.linalg.norm(q) + 1e-8)
+            if k > self.ef_search_current:
+                # Ensure ef_search >= k
+                try:
+                    self.ann.set_ef(k)
+                    self.ef_search_current = k
+                    log.debug(f"[{self.name}] set_ef({k}) (raised for query)")
+                except Exception as e:
+                    log.debug(f"[{self.name}] set_ef({k}) failed: {e}")
+
+            labels, dists = self.ann.knn_query(qn, k=k)
+            sims = 1.0 - np.clip(dists[0], 0.0, 1.0)  # cosine distance -> sim
+            idxs = labels[0]
+            return [(self.image_ids[int(idxs[j])], float(sims[j])) for j in range(len(idxs))]
+
+        # Linear cosine (NumPy)
+        qn = np.linalg.norm(q) + 1e-8
+        sims = (self.X @ q) / (qn * self._norms)  # self._norms already +eps
+        order = np.argsort(sims)[::-1][:k]
+        return [(self.image_ids[i], float(sims[i])) for i in order]
 
 
 class ImageRecommender:
     """
-    Hauptklasse - orchestriert alles (Projektanforderung erfüllt)
+    High-level image recommender combining cheap features and deep embeddings.
+    Builds both indices and supports single- and multi-query search + re-ranking.
     """
-    
-    def __init__(self, database: ImageDatabase, weights: Dict[str, float] = None):
-        """
-        Initialisiert den Image Recommender
-        
-        Args:
-            database (ImageDatabase): Referenz zur Image Database
-            weights (Dict): Gewichtung der Similarity-Measures
-        """
+
+    def __init__(
+        self,
+        database: ImageDatabase,
+        weights: Optional[Dict[str, float]] = None,
+        color_bins: Optional[int] = None,
+        k_colors: Optional[int] = None,
+        ann_threshold: int = 1000,
+        hnsw_M: int = 16,
+        hnsw_ef_construction: int = 200,
+        hnsw_ef_search: int = 200
+    ):
+        """Wire DB, infer color params, init indices and embedder."""
         self.db = database
-        self.similarity_calc = SimilarityCalculator()
-        self.ann = ApproximateNearestNeighbor()
-        
-        # Standard-Gewichtung der 3 Similarity-Measures
-        self.weights = weights or {
-            'color': 0.4,        # Color-based Similarity
-            'embedding': 0.3,    # Deep Learning Embeddings  
-            'custom': 0.3        # Custom Multi-Modal
-        }
-        
-        self.logger = logging.getLogger(__name__)
-        
-        # Index beim Start aufbauen
-        self._build_search_index()
-    
-    def _build_search_index(self):
-        """Baut Suchindex für alle Bilder in der Datenbank auf"""
-        start_time = time.time()
-        
-        # Alle Image IDs holen
-        image_ids = self.db.get_all_image_ids()
-        
-        if not image_ids:
-            self.logger.warning("Keine Bilder in der Datenbank gefunden!")
-            return
-        
-        # Feature-Vektoren für ANN erstellen
-        feature_vectors = []
-        valid_image_ids = []
-        
-        for image_id in image_ids:
-            features = self._extract_combined_features(image_id)
-            if features is not None:
-                feature_vectors.append(features)
-                valid_image_ids.append(image_id)
-        
-        # ANN Index aufbauen
-        if feature_vectors:
-            self.ann.build_index(valid_image_ids, feature_vectors)
-            build_time = time.time() - start_time
-            self.logger.info(f"Suchindex für {len(valid_image_ids)} Bilder aufgebaut ({build_time:.2f}s)")
-        else:
-            self.logger.error("Keine gültigen Feature-Vektoren gefunden!")
-    
-    def _extract_combined_features(self, image_id: str) -> Optional[np.ndarray]:
-        """
-        Extrahiert kombinierten Feature-Vektor für ein Bild
-        
-        Args:
-            image_id (str): Image ID
-            
-        Returns:
-            Optional[np.ndarray]: Kombinierter Feature-Vektor oder None
-        """
+        inferred_bins, inferred_k = _infer_db_color_params(self.db.db_path)
+        self.color_bins = color_bins or inferred_bins
+        self.k_colors = k_colors or inferred_k
+
+        self.sim = SimilarityCalculator()
+        self.weights = weights or {'color': 0.4, 'embedding': 0.4, 'custom': 0.2}
+        self.embedder = VisionEmbedder(model_name="mobilenet_v3_large", proj_dim=128, seed=42)
+
+        self.idx_cheap = ApproximateNearestNeighbor(
+            use_ann_threshold=ann_threshold,
+            M=hnsw_M, ef_construction=hnsw_ef_construction, ef_search=hnsw_ef_search
+        )
+        self.idx_deep = ApproximateNearestNeighbor(
+            use_ann_threshold=ann_threshold,
+            M=hnsw_M, ef_construction=hnsw_ef_construction, ef_search=hnsw_ef_search
+        )
+        self._build_indices()
+
+    def _row_to_cheap(self, row) -> Optional[Tuple[str, np.ndarray, Optional[str]]]:
+        """Row -> (image_id, cheap_vector, phash_hex)."""
         try:
-            # Features aus DB laden
-            color_features = self.db.get_color_features(image_id)
-            
-            with sqlite3.connect(self.db.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT texture_features FROM advanced_features WHERE image_id = ?", (image_id,))
-                row = cursor.fetchone()
-                advanced_features = {'texture_features': json.loads(row[0])} if row and row[0] else None
-            
-            if not color_features:
-                return None
-            
-            # Feature-Vektor erstellen
-            features = []
-            
-            # Color Features
-            dominant_colors = np.array(color_features['dominant_colors']).flatten()
-            color_stats = [
-                color_features['color_stats']['brightness'],
-                *color_features['color_stats']['mean_bgr'],
-                *color_features['color_stats']['std_bgr']
-            ]
-            features.extend(dominant_colors)
-            features.extend(color_stats)
-            
-            # Texture Features
-            if advanced_features and advanced_features['texture_features']:
-                texture = advanced_features['texture_features']
-                features.extend([texture.get('mean', 0), texture.get('std', 0), texture.get('variance', 0)])
-            else:
-                features.extend([0, 0, 0])  # Placeholder
-            
-            return np.array(features)
-            
-        except Exception as e:
-            self.logger.error(f"Fehler beim Extrahieren von Features für {image_id}: {e}")
-            return None
-    
-    def _calculate_combined_similarity(self, image_id1: str, image_id2: str) -> float:
-        """
-        Berechnet kombinierte Similarity zwischen zwei Bildern
-        
-        Args:
-            image_id1 (str): Erste Image ID
-            image_id2 (str): Zweite Image ID
-            
-        Returns:
-            float: Kombinierte Similarity (0-1)
-        """
-        try:
-            # Features laden
-            color_features1 = self.db.get_color_features(image_id1)
-            color_features2 = self.db.get_color_features(image_id2)
-            if not color_features1 or not color_features2:
-                return 0.0           
-            
-            # Advanced Features laden
-            with sqlite3.connect(self.db.db_path) as conn:
-                cursor = conn.cursor()
-
-                cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id IN (?, ?)", 
-                             (image_id1, image_id2))
-                #rows = cursor.fetchall()
-                
-                #advanced_features1 = {'texture_features': json.loads(rows[0][0])} if rows and rows[0][0] else {}
-                #advanced_features2 = {'texture_features': json.loads(rows[1][0])} if len(rows) > 1 and rows[1][0] else {}
-                row1 = cursor.fetchone()
-                adv1 = {'texture_features': json.loads(row1[0])} if row1 and row1[0] else {}
-                ph1 = (json.loads(row1[1]).get('phash_hex') if row1 and row1[1] else None)
-
-                cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id = ?", (image_id2,))
-                row2 = cursor.fetchone()
-                adv2 = {'texture_features': json.loads(row2[0])} if row2 and row2[0] else {}
-                ph2 = (json.loads(row2[1]).get('phash_hex') if row2 and row2[1] else None)
-
-
-            # Alle 3 Similarity-Measures berechnen
-            color_sim = self.similarity_calc.calculate_color_similarity(color_features1, color_features2)
-            embedding_sim = self.similarity_calc.calculate_embedding_similarity(adv1, adv2)
-            custom_sim = self.similarity_calc.calculate_custom_similarity(
-                adv1, adv2, color_features1, color_features2,
-                phash_hex1=ph1, phash_hex2=ph2
-            )
-            
-            # Gewichtete Kombination
-            combined_sim = (
-                self.weights['color'] * color_sim +
-                self.weights['embedding'] * embedding_sim +
-                self.weights['custom'] * custom_sim
-            )
-            
-            return combined_sim
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei Similarity-Berechnung: {e}")
-            return 0.0
-    
-    def find_similar_images(self, input_image: Union[str, np.ndarray], top_k: int = 5) -> List[Dict]:
-        """
-        Findet ähnlichste Bilder für ein Eingabebild (Hauptanforderung)
-        
-        Args:
-            input_image (Union[str, np.ndarray]): Pfad zum Bild oder Bild-Array
-            top_k (int): Anzahl zurückzugebender ähnlicher Bilder
-            
-        Returns:
-            List[Dict]: Liste der ähnlichsten Bilder mit Metadaten und Scores
-        """
-        start_time = time.time()
-        
-        try:
-            # Input-Bild laden falls Pfad gegeben
-            if isinstance(input_image, str):
-                query_image = cv2.imread(input_image)
-                if query_image is None:
-                    raise ValueError(f"Kann Bild nicht laden: {input_image}")
-            else:
-                query_image = input_image
-            
-            # Features für Query-Bild extrahieren
-            query_color_features = self.similarity_calc.color_analyzer.extract_color_features(query_image)
-            query_advanced_features = self.similarity_calc.feature_extractor.extract_texture_features(query_image)
-            try:
-                _q = compute_phash(query_image)
-                query_phash_hex = hex(int(_q)) if _q is not None else None
-            except Exception:
-                query_phash_hex = None
-
-            # Alle Bilder in DB vergleichen
-            all_image_ids = self.db.get_all_image_ids()
-            similarities = []
-            
-            for image_id in all_image_ids:
+            iid = row[0]
+            dom = np.array(json.loads(row[1]), dtype=np.float32).flatten()
+            stats = json.loads(row[2])
+            vstats = [stats['brightness'], *stats['mean_bgr'], *stats['std_bgr']]
+            vec = list(dom) + vstats
+            # texture placeholders (3 simple moments)
+            if row[3]:
                 try:
-                    # Features aus DB laden
-                    db_color_features = self.db.get_color_features(image_id)
-                    if not db_color_features:
-                        continue
-                    
-                    with sqlite3.connect(self.db.db_path) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT texture_features, custom_features FROM advanced_features WHERE image_id = ?", (image_id,))
-                        row = cursor.fetchone()
-                        db_advanced_features, db_phash_hex = {}, None
-                        if row:
-                            # texture_features
-                            if row[0]:
-                                try:
-                                    db_advanced_features = {'texture_features': json.loads(row[0])}
-                                except Exception:
-                                    db_advanced_features = {}
-                            # custom_features → pHash
-                            if row[1]:
-                                try:
-                                    cf = json.loads(row[1])
-                                    if isinstance(cf, dict):
-                                        db_phash_hex = cf.get('phash_hex')
-                                except Exception:
-                                    db_phash_hex = None
-                    
-                    # Similarity berechnen
-                    color_sim = self.similarity_calc.calculate_color_similarity(query_color_features, db_color_features)
-                    embedding_sim = self.similarity_calc.calculate_embedding_similarity(query_advanced_features, db_advanced_features)
-                    custom_sim = self.similarity_calc.calculate_custom_similarity(
-                        query_advanced_features, db_advanced_features, query_color_features, db_color_features,
-                        phash_hex1=query_phash_hex, phash_hex2=db_phash_hex
-                    )
-                    
-                    # Kombinierte Similarity
-                    combined_sim = (
-                        self.weights['color'] * color_sim +
-                        self.weights['embedding'] * embedding_sim +
-                        self.weights['custom'] * custom_sim
-                    )
-                    
-                    similarities.append((image_id, combined_sim, {
-                        'color_similarity': color_sim,
-                        'embedding_similarity': embedding_sim,
-                        'custom_similarity': custom_sim
-                    }))
-                    
-                except Exception as e:
-                    self.logger.warning(f"Fehler bei Vergleich mit {image_id}: {e}")
-                    continue
-            
-            # Top-k ähnlichste auswählen
-            similarities.sort(key=lambda x: x[1], reverse=True)
-            top_similarities = similarities[:top_k]
-            
-            # Ergebnisse mit Metadaten zusammenstellen
-            results = []
-            for image_id, similarity, detailed_scores in top_similarities:
-                metadata = self.db.get_image_metadata(image_id)
-                
-                result = {
-                    'image_id': image_id,
-                    'similarity_score': similarity,
-                    'detailed_scores': detailed_scores,
-                    'metadata': metadata
-                }
-                results.append(result)
-            
-            search_time = time.time() - start_time
-            self.logger.info(f"Ähnlichkeitssuche abgeschlossen in {search_time:.2f}s")
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei find_similar_images: {e}")
-            return []
-    
-    def find_similar_multi_input(self, image_list: List[Union[str, np.ndarray]], 
-                                top_k: int = 5, combination_method: str = 'average') -> List[Dict]:
-        """
-        Findet ähnlichste Bilder für mehrere Eingabebilder (Zusatzanforderung)
-        
-        Args:
-            image_list (List): Liste von Bildpfaden oder Bild-Arrays
-            top_k (int): Anzahl zurückzugebender Bilder
-            combination_method (str): Methode zur Kombination ('average', 'max', 'weighted')
-            
-        Returns:
-            List[Dict]: Liste der ähnlichsten Bilder
-        """
-        if not image_list:
-            return []
-        
-        self.logger.info(f"Multi-Input Suche mit {len(image_list)} Bildern")
-        
-        # Für jedes Input-Bild Similarities berechnen
-        all_results = []
-        for i, input_image in enumerate(image_list):
-            results = self.find_similar_images(input_image, top_k=top_k*2)  # Mehr holen für bessere Kombination
-            all_results.append(results)
-        
-        # Ergebnisse kombinieren
-        combined_scores = {}
-        
-        for results in all_results:
-            for result in results:
-                image_id = result['image_id']
-                similarity = result['similarity_score']
-                
-                if image_id not in combined_scores:
-                    combined_scores[image_id] = []
-                combined_scores[image_id].append(similarity)
-        
-        # Scores je nach Methode kombinieren
-        final_scores = []
-        for image_id, scores in combined_scores.items():
-            if combination_method == 'average':
-                final_score = np.mean(scores)
-            elif combination_method == 'max':
-                final_score = np.max(scores)
-            elif combination_method == 'weighted':
-                # Gewichtung: mehr Gewicht wenn von mehr Input-Bildern ähnlich
-                weight = len(scores) / len(image_list)
-                final_score = np.mean(scores) * weight
+                    t = json.loads(row[3])
+                    vec += [float(t.get('mean', 0)), float(t.get('std', 0)), float(t.get('variance', 0))]
+                except Exception:
+                    vec += [0.0, 0.0, 0.0]
             else:
-                final_score = np.mean(scores)
-            
-            final_scores.append((image_id, final_score))
-        
-        # Top-k auswählen
-        final_scores.sort(key=lambda x: x[1], reverse=True)
-        top_final = final_scores[:top_k]
-        
-        # Ergebnisse mit Metadaten zusammenstellen
-        results = []
-        for image_id, final_score in top_final:
-            metadata = self.db.get_image_metadata(image_id)
-            
-            result = {
-                'image_id': image_id,
-                'combined_similarity_score': final_score,
-                'combination_method': combination_method,
-                'metadata': metadata
-            }
-            results.append(result)
-        
-        return results
-    
-    def get_recommendations(self, image_id: str = None, random_seed: bool = False, 
-                          top_k: int = 5) -> List[Dict]:
-        """
-        Allgemeine Empfehlungsfunktion
-        
-        Args:
-            image_id (str): Basis-Bild für Empfehlungen (optional)
-            random_seed (bool): Zufälliges Startbild verwenden
-            top_k (int): Anzahl Empfehlungen
-            
-        Returns:
-            List[Dict]: Liste von Empfehlungen
-        """
+                vec += [0.0, 0.0, 0.0]
+            ph = None
+            if row[4]:
+                try:
+                    cf = json.loads(row[4])
+                    if isinstance(cf, dict):
+                        ph = cf.get('phash_hex')
+                except Exception:
+                    pass
+            return iid, np.asarray(vec, dtype=np.float32), ph
+        except Exception:
+            return None
+
+    def _iter_rows(self):
+        """Yield joined rows of images + color_features + advanced_features."""
+        con = sqlite3.connect(self.db.db_path)
+        c = con.cursor()
+        c.execute(
+            """
+            SELECT i.image_id, cf.dominant_colors, cf.color_stats,
+                   af.texture_features, af.custom_features,
+                   af.deep_embeddings, af.deep_dim
+            FROM images i
+            JOIN color_features cf ON cf.image_id = i.image_id
+            LEFT JOIN advanced_features af ON af.image_id = i.image_id
+            """
+        )
+        rows = c.fetchall()
+        con.close()
+        return rows
+
+    def _build_indices(self):
+        """Build both indices from DB content (cheap + deep)."""
+        t0 = time.time()
+        ids_cheap, Xc, ids_deep, Xd = [], [], [], []
+        deep_count = 0
+
+        for r in self._iter_rows():
+            cheap = self._row_to_cheap(r)
+            if cheap:
+                iid, v, _ = cheap
+                ids_cheap.append(iid)
+                Xc.append(v)
+
+            blob, dim = r[5], r[6]
+            if blob is not None and dim:
+                try:
+                    arr = np.frombuffer(blob, dtype=np.float32)
+                    if arr.size == int(dim):
+                        ids_deep.append(r[0])
+                        Xd.append(arr)
+                        deep_count += 1
+                except Exception:
+                    pass
+
+        if ids_cheap:
+            self.idx_cheap.build(ids_cheap, np.asarray(Xc, dtype=np.float32), name="cheap")
+        if ids_deep:
+            self.idx_deep.build(ids_deep, np.asarray(Xd, dtype=np.float32), name="deep")
+
+        log.info(
+            f"Indices built in {time.time()-t0:.2f}s | cheap={len(ids_cheap)}, deep={deep_count}"
+        )
+
+    def _query_features(self, img: np.ndarray):
+        """Compute query features: cheap vec, deep embedding, CF dict, ADV dict, phash hex."""
+        # color features
+        cf = self.sim.color_analyzer.extract_color_features(
+            img, num_bins=self.color_bins, num_dominant=self.k_colors
+        )
+        # simple texture stats
+        tf = self.sim.feature_extractor.extract_texture_features(img)
+
+        # compact helper resize for pHash
+        def _shrink_for_phash(im, max_side=256):
+            h, w = im.shape[:2]
+            s = max(h, w)
+            if s > max_side:
+                scale = max_side / float(s)
+                return cv2.resize(im, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            return im
+
         try:
-            all_image_ids = self.db.get_all_image_ids()
-            
-            if not all_image_ids:
-                self.logger.warning("Keine Bilder in der Datenbank!")
-                return []
-            
-            # Basis-Bild bestimmen
-            if random_seed or image_id is None:
-                import random
-                base_image_id = random.choice(all_image_ids)
-                self.logger.info(f"Verwende zufälliges Basis-Bild: {base_image_id}")
-            else:
-                base_image_id = image_id
-            
-            # Ähnliche Bilder für Basis-Bild finden
-            base_metadata = self.db.get_image_metadata(base_image_id)
-            if not base_metadata:
-                self.logger.error(f"Metadaten für {base_image_id} nicht gefunden")
-                return []
-            
-            # Basis-Bild laden und Empfehlungen finden
-            base_image = cv2.imread(base_metadata['filepath'])
-            if base_image is None:
-                self.logger.error(f"Kann Basis-Bild nicht laden: {base_metadata['filepath']}")
-                return []
-            
-            recommendations = self.find_similar_images(base_image, top_k=top_k+1)  # +1 weil Basis-Bild dabei sein könnte
-            
-            # Basis-Bild aus Empfehlungen entfernen
-            recommendations = [r for r in recommendations if r['image_id'] != base_image_id][:top_k]
-            
-            # Basis-Bild Info hinzufügen
-            for rec in recommendations:
-                rec['based_on_image'] = {
-                    'image_id': base_image_id,
-                    'filename': base_metadata['filename']
-                }
-            
-            return recommendations
-            
-        except Exception as e:
-            self.logger.error(f"Fehler bei get_recommendations: {e}")
+            shrink = _shrink_for_phash(img, max_side=256)
+            ph_hex = hex(compute_phash(shrink))
+        except Exception:
+            ph_hex = None
+
+        dom = np.array(cf['dominant_colors'], dtype=np.float32).flatten()
+        stats = cf['color_stats']
+        vstats = [stats['brightness'], *stats['mean_bgr'], *stats['std_bgr']]
+        cheap_vec = np.asarray(
+            list(dom) + vstats + [tf.get('mean', 0), tf.get('std', 0), tf.get('variance', 0)],
+            dtype=np.float32
+        )
+
+        # deep embedding if available
+        z = self.embedder.embed_array(img) if self.embedder.available() else None
+        return cheap_vec, z, cf, {'texture_features': tf}, ph_hex
+
+    def _bulk_fetch_candidates(self, cand_ids: List[str]):
+        """Fetch color/adv/embedding blobs for a candidate id list."""
+        if not cand_ids:
             return []
-    
+
+        con = sqlite3.connect(self.db.db_path)
+        c = con.cursor()
+        ph = ",".join(["?"] * len(cand_ids))
+        c.execute(
+            f"""
+            SELECT i.image_id,
+                   cf.dominant_colors, cf.hsv_histogram, cf.bgr_histogram, cf.color_stats,
+                   af.texture_features, af.custom_features, af.deep_embeddings, af.deep_dim
+            FROM images i
+            JOIN color_features cf ON cf.image_id=i.image_id
+            LEFT JOIN advanced_features af ON af.image_id=i.image_id
+            WHERE i.image_id IN ({ph})
+            """,
+            cand_ids,
+        )
+        rows = c.fetchall()
+        con.close()
+        return rows
+
+    def _rerank(
+        self,
+        q_cf: Dict, q_adv: Dict,
+        q_deep: Optional[np.ndarray], q_ph: Optional[str],
+        rows: List[tuple],
+        top_k: int
+    ) -> List[Dict]:
+        """Compute final scores and return top-k result dicts."""
+        results = []
+        for r in rows:
+            iid = r[0]
+            db_cf = {
+                'dominant_colors': json.loads(r[1]),
+                'hsv_histogram': json.loads(r[2]),
+                'bgr_histogram': json.loads(r[3]),
+                'color_stats': json.loads(r[4]),
+            }
+
+            db_adv = {}
+            db_ph = None
+            if r[5]:
+                try:
+                    db_adv = {'texture_features': json.loads(r[5])}
+                except Exception:
+                    db_adv = {}
+            if r[6]:
+                try:
+                    cfj = json.loads(r[6])
+                    if isinstance(cfj, dict):
+                        db_ph = cfj.get('phash_hex')
+                except Exception:
+                    db_ph = None
+
+            db_emb = None
+            if r[7] is not None and r[8]:
+                try:
+                    emb_arr = np.frombuffer(r[7], dtype=np.float32)
+                    if emb_arr.size == int(r[8]):
+                        db_emb = emb_arr
+                except Exception:
+                    db_emb = None
+
+            c_sim = self.sim.color_sim(q_cf, db_cf)
+            e_sim = self.sim.emb_sim(q_deep, db_emb, q_adv, db_adv)
+            u_sim = self.sim.custom_sim(q_adv, db_adv, q_cf, db_cf, q_ph, db_ph)
+
+            score = (
+                self.weights['color'] * c_sim +
+                self.weights['embedding'] * e_sim +
+                self.weights['custom'] * u_sim
+            )
+            results.append(
+                (iid, float(score),
+                 {'color_similarity': c_sim, 'embedding_similarity': e_sim, 'custom_similarity': u_sim})
+            )
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        results = results[:top_k]
+
+        out = []
+        for iid, sc, det in results:
+            meta = self.db.get_image_metadata(iid)
+            out.append({'image_id': iid, 'similarity_score': sc, 'detailed_scores': det, 'metadata': meta})
+        return out
+
+    def find_similar_images(
+        self,
+        input_image: Union[str, np.ndarray],
+        top_k: int = 5,
+        candidates: int = 200
+    ) -> List[Dict]:
+        """Single-query search: extract features → ANN/linear candidates → re-rank."""
+        T = {}
+        t = time.time()
+        if isinstance(input_image, str):
+            qimg = cv2.imread(input_image)
+            if qimg is None:
+                raise ValueError(f"Cannot load image: {input_image}")
+        else:
+            qimg = input_image
+        T['load'] = time.time() - t
+
+        t = time.time()
+        q_cheap, q_deep, q_cf, q_adv, q_ph = self._query_features(qimg)
+        T['features'] = time.time() - t
+
+        # choose index
+        use_deep = (len(self.idx_deep.image_ids) > 0) and (q_deep is not None)
+        idx = self.idx_deep if use_deep else self.idx_cheap
+        N = len(idx.image_ids)
+        k = min(max(top_k * 10, candidates), max(1, N))
+
+        t = time.time()
+        nbrs = idx.knn(q_deep if use_deep else q_cheap, k)
+        T['ann'] = time.time() - t
+        if not nbrs:
+            return []
+
+        cand_ids = [i for i, _ in nbrs]
+
+        t = time.time()
+        rows = self._bulk_fetch_candidates(cand_ids)
+        T['dbfetch'] = time.time() - t
+
+        t = time.time()
+        out = self._rerank(q_cf, q_adv, q_deep, q_ph, rows, top_k)
+        T['rerank'] = time.time() - t
+
+        log.info(
+            f"Search: load={T['load']:.3f}s feat={T['features']:.3f}s ann={T['ann']:.3f}s "
+            f"db={T['dbfetch']:.3f}s rerank={T['rerank']:.3f}s | "
+            f"index={'deep' if use_deep else 'cheap'} N={N}"
+        )
+        return out
+
+    def find_similar_multi_input(
+        self,
+        input_images: List[Union[str, np.ndarray]],
+        top_k: int = 5,
+        candidates: int = 200,
+        combine: str = "mean"
+    ) -> List[Dict]:
+        """Multi-query search: average or max combine of query features/embeddings."""
+        if not input_images:
+            return []
+
+        T = {}
+        t = time.time()
+        q_cheaps, q_deeps, q_cfs, q_advs, q_phs = [], [], [], [], []
+
+        # extract all query features
+        for item in input_images:
+            if isinstance(item, str):
+                img = cv2.imread(item)
+                if img is None:
+                    log.warning(f"Skipping unreadable image: {item}")
+                    continue
+            else:
+                img = item
+            c, z, cf, adv, ph = self._query_features(img)
+            q_cheaps.append(c)
+            if z is not None:
+                q_deeps.append(z)
+            q_cfs.append(cf)
+            q_advs.append(adv)
+            q_phs.append(ph)
+
+        if not q_cheaps:
+            return []
+
+        # combine features
+        if combine == "max":
+            q_cheap = np.max(np.vstack(q_cheaps), axis=0)
+            q_deep = np.max(np.vstack(q_deeps), axis=0) if q_deeps else None
+        else:  # mean (default)
+            q_cheap = np.mean(np.vstack(q_cheaps), axis=0)
+            q_deep = np.mean(np.vstack(q_deeps), axis=0) if q_deeps else None
+
+        # simple merger for dict-like parts (use first as representative)
+        q_cf = q_cfs[0]
+        q_adv = q_advs[0]
+        q_ph = q_phs[0]
+        T['features_multi'] = time.time() - t
+
+        # choose index
+        use_deep = (len(self.idx_deep.image_ids) > 0) and (q_deep is not None)
+        idx = self.idx_deep if use_deep else self.idx_cheap
+        N = len(idx.image_ids)
+        k = min(max(top_k * 10, candidates), max(1, N))
+
+        t = time.time()
+        nbrs = idx.knn(q_deep if use_deep else q_cheap, k)
+        T['ann'] = time.time() - t
+        if not nbrs:
+            return []
+
+        cand_ids = [i for i, _ in nbrs]
+
+        t = time.time()
+        rows = self._bulk_fetch_candidates(cand_ids)
+        T['dbfetch'] = time.time() - t
+
+        t = time.time()
+        out = self._rerank(q_cf, q_adv, q_deep, q_ph, rows, top_k)
+        T['rerank'] = time.time() - t
+
+        log.info(
+            f"Multi-search: q={len(q_cheaps)} combine={combine} feat={T['features_multi']:.3f}s "
+            f"ann={T['ann']:.3f}s db={T['dbfetch']:.3f}s rerank={T['rerank']:.3f}s | "
+            f"index={'deep' if use_deep else 'cheap'} N={N}"
+        )
+        return out
+
     def get_system_stats(self) -> Dict:
-        """Gibt Statistiken über das Recommender-System zurück"""
-        db_stats = self.db.get_database_stats()
-        
+        """Return simple index/weight stats for UI."""
         return {
-            'database_stats': db_stats,
-            'similarity_weights': self.weights,
-            'ann_threshold': self.ann.use_ann_threshold,
-            'indexed_images': len(self.ann.image_ids) if hasattr(self.ann, 'image_ids') else 0
+            'weights': self.weights,
+            'cheap_index_size': len(self.idx_cheap.image_ids),
+            'deep_index_size': len(self.idx_deep.image_ids)
         }
 
 
-# Convenience-Funktionen für einfache Verwendung
+# Convenience bootstrap
 def create_recommender_system(image_directory: str, db_path: str = "image_recommender.db") -> ImageRecommender:
-    """
-    Erstellt komplettes Recommender-System aus Bildverzeichnis
-    
-    Args:
-        image_directory (str): Pfad zu Bildverzeichnis
-        db_path (str): Pfad zur Datenbank
-        
-    Returns:
-        ImageRecommender: Initialisiertes System
-    """
-    # Database mit Bildern initialisieren
-    from image_database import initialize_database_with_images
-    db = initialize_database_with_images(image_directory, db_path)
-    
-    # Recommender erstellen
-    recommender = ImageRecommender(db)
-    
-    print("=== Image Recommender System bereit! ===")
-    print(f"Statistiken: {recommender.get_system_stats()}")
-    
-    return recommender
+    """Optional helper: ingest a folder then build the recommender."""
+    db = ImageDatabase(db_path)
+    if image_directory:
+        db.bulk_add_directory(image_directory, recursive=True)
+    return ImageRecommender(db)
 
 
 if __name__ == "__main__":
-    # Beispiel für die Verwendung mit deinen 5 Bildern
-    IMAGE_DIR = "/Users/juliamoor/Desktop/bigdata_ir/Bilder"  # Passe den Pfad an!
-    
-    # Komplettes System erstellen
-    recommender = create_recommender_system(IMAGE_DIR)
-    
-    # Test 1: Ähnliche Bilder für erstes Bild finden
-    print("\n=== Test 1: find_similar_images ===")
-    all_ids = recommender.db.get_all_image_ids()
-    if all_ids:
-        first_image_metadata = recommender.db.get_image_metadata(all_ids[0])
-        first_image_path = first_image_metadata['filepath']
-        
-        similar_images = recommender.find_similar_images(first_image_path, top_k=3)
-        
-        print(f"Ähnliche Bilder zu {first_image_metadata['filename']}:")
-        for i, result in enumerate(similar_images, 1):
-            print(f"  {i}. {result['metadata']['filename']} (Score: {result['similarity_score']:.3f})")
-            print(f"     Details: Color={result['detailed_scores']['color_similarity']:.3f}, "
-                  f"Embedding={result['detailed_scores']['embedding_similarity']:.3f}, "
-                  f"Custom={result['detailed_scores']['custom_similarity']:.3f}")
-    
-    # Test 2: Multi-Input Suche
-    print("\n=== Test 2: find_similar_multi_input ===")
-    if len(all_ids) >= 2:
-        # Erste zwei Bilder als Input verwenden
-        input_images = []
-        for i in range(min(2, len(all_ids))):
-            metadata = recommender.db.get_image_metadata(all_ids[i])
-            input_images.append(metadata['filepath'])
-        
-        multi_results = recommender.find_similar_multi_input(input_images, top_k=2)
-        
-        print(f"Multi-Input Suche mit {len(input_images)} Bildern:")
-        for i, result in enumerate(multi_results, 1):
-            print(f"  {i}. {result['metadata']['filename']} (Combined Score: {result['combined_similarity_score']:.3f})")
-    
-    # Test 3: Allgemeine Empfehlungen
-    print("\n=== Test 3: get_recommendations ===")
-    recommendations = recommender.get_recommendations(random_seed=True, top_k=2)
-    
-    print("Zufällige Empfehlungen:")
-    for i, rec in enumerate(recommendations, 1):
-        print(f"  {i}. {rec['metadata']['filename']} (Score: {rec['similarity_score']:.3f})")
-        print(f"     Basierend auf: {rec['based_on_image']['filename']}")
+    IMAGE_PATH = None
+    rec = create_recommender_system(image_directory="")
+    if IMAGE_PATH:
+        res = rec.find_similar_images(IMAGE_PATH, top_k=5)
+        for i, r in enumerate(res, 1):
+            print(f"{i}. {r['metadata'].get('filename','?')} (Score: {r['similarity_score']:.3f})")
