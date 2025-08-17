@@ -1,587 +1,677 @@
-import sqlite3, os, json, hashlib, datetime
-from pathlib import Path
-from typing import Generator, List, Dict, Optional, Tuple, Any
-import cv2
-import numpy as np
+# Fast image ingest into SQLite (WAL). Primary JPEG decode via pyTurboJPEG with compressed-domain scaling.
+# Falls back to OpenCV decoders. Thread/Process pools supported. Rich metrics & logging.
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import json
+import hashlib
+import datetime
 import logging
+import time
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
 
-from FeatureExtraction import ColorAnalyzer, compute_phash, ImageFeatureExtractor
-logger = logging.getLogger("ImageDatabase")
+import numpy as np
+import cv2
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# Import der eigenen Feature Extraction
-# from FeatureExtraction import ColorAnalyzer, 
+from FeatureExtraction import ColorAnalyzer, compute_phash
 
 
+__all__ = ["ImageDatabase"]
+
+# ----------------------------- logging ---------------------------------------
+log = logging.getLogger("ImageDatabase")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
+# ----------------------------- constants -------------------------------------
+ALLOWED_EXTS = {".jpg", ".jpeg"}  # could be extended: ".png", ".bmp", ".tiff", ".webp"
+JPEG_EXTS = {".jpg", ".jpeg"}
+
+# ----------------------------- TurboJPEG -------------------------------------
+HAVE_TURBO = False
+try:
+    from turbojpeg import TurboJPEG, TJPF_BGR, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
+    HAVE_TURBO = True
+except Exception:
+    HAVE_TURBO = False
+
+
+class _TLS:
+    """Thread-local store for TurboJPEG handle."""
+    turbo: Optional["TurboJPEG"] = None
+    turbo_init_failed: bool = False
+
+
+TLS = _TLS()
+
+
+def _get_turbo() -> Optional["TurboJPEG"]:
+    """Return (and lazily init) a TurboJPEG handle if available, else None."""
+    if not HAVE_TURBO or TLS.turbo_init_failed:
+        return None
+    if TLS.turbo is not None:
+        return TLS.turbo
+
+    # Try explicit env var first, then common install paths (macOS/Homebrew, Windows, Linux).
+    candidates = [
+        os.environ.get("TURBOJPEG"),
+        "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",  # macOS (Apple Silicon)
+        "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",     # macOS (Intel)
+        "/opt/local/lib/libturbojpeg.dylib",                    # macOS (MacPorts)
+        "/usr/lib/libturbojpeg.so",                             # Linux
+        "/usr/lib/x86_64-linux-gnu/libturbojpeg.so",            # Linux (Debian/Ubuntu)
+        r"C:\libjpeg-turbo\bin\turbojpeg.dll",                  # Windows
+    ]
+    try:
+        lib = next((p for p in candidates if p and os.path.exists(p)), None)
+        TLS.turbo = TurboJPEG(lib) if lib else TurboJPEG()  # falls back to system paths
+        return TLS.turbo
+    except Exception as e:
+        log.info(f"TurboJPEG not available ({e}); using fallback decoders.")
+        TLS.turbo_init_failed = True
+        return None
+
+
+# ----------------------------- helpers ---------------------------------------
+def _now_iso() -> str:
+    """Current timestamp in ISO format (seconds)."""
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _fmt_dur(sec: float) -> str:
+    """Format seconds into HH:MM:SS."""
+    sec = int(max(0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _init_worker() -> None:
+    """Reduce nested threading (OpenCV/BLAS) in worker processes for stability."""
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+
+def _file_hash_stream(path: str, block_size: int = 1 << 20) -> str:
+    """MD5 over file contents (streaming)."""
+    h = hashlib.md5()
+    with open(path, "rb", buffering=0) as f:
+        for chunk in iter(lambda: f.read(block_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_bytes(path: str) -> Optional[bytes]:
+    """Read file into bytes; return None on error."""
+    try:
+        with open(path, "rb", buffering=0) as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _decode_turbo(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
+    """Decode JPEG via TurboJPEG using compressed-domain scaling (1/1, 1/2, 1/4, 1/8). Returns BGR."""
+    tj = _get_turbo()
+    if tj is None:
+        return None
+    data = _read_bytes(path)
+    if data is None:
+        return None
+    # Map 1|2|4|8 to scaling factors accepted by TurboJPEG
+    sf = {1: (1, 1), 2: (1, 2), 4: (1, 4), 8: (1, 8)}.get(int(jpeg_reduce), (1, 8))
+    try:
+        img = tj.decode(
+            data,
+            pixel_format=TJPF_BGR,
+            scaling_factor=sf,
+            flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT,
+        )
+        return img
+    except Exception:
+        return None
+
+
+def _decode_imdecode(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
+    """Decode via cv2.imdecode; optionally post-scale JPEG to approx. 1/reduce."""
+    data = _read_bytes(path)
+    if data is None:
+        return None
+    try:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None and Path(path).suffix.lower() in JPEG_EXTS and jpeg_reduce in (2, 4, 8):
+            f = 1.0 / float(jpeg_reduce)
+            h, w = img.shape[:2]
+            img = cv2.resize(img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA)
+        return img
+    except Exception:
+        return None
+
+
+def _decode_opencv(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
+    """OpenCV imread with JPEG reduced decode (IMREAD_REDUCED_COLOR_X) where available."""
+    try:
+        flag = cv2.IMREAD_COLOR
+        ext = Path(path).suffix.lower()
+        if ext in JPEG_EXTS and jpeg_reduce in (2, 4, 8):
+            flag = getattr(cv2, f"IMREAD_REDUCED_COLOR_{jpeg_reduce}")
+        return cv2.imread(path, flag)
+    except Exception:
+        return None
+
+
+def _decode_image(path: str, decode_mode: str, jpeg_reduce: int) -> Tuple[Optional[np.ndarray], str]:
+    """Try decoders according to `decode_mode`. Return (BGR image, decoder_used)."""
+    # Skip resource forks / junk files
+    name = Path(path).name
+    if name.startswith("._") or name == ".DS_Store":
+        return None, "skip"
+
+    ext = Path(path).suffix.lower()
+
+    if decode_mode == "turbo":
+        if ext in JPEG_EXTS:
+            img = _decode_turbo(path, jpeg_reduce)
+            return img, ("turbo" if img is not None else "fail")
+        img = _decode_opencv(path, jpeg_reduce)
+        return img, ("opencv" if img is not None else "fail")
+
+    if decode_mode == "imdecode":
+        img = _decode_imdecode(path, jpeg_reduce)
+        return img, ("imdecode" if img is not None else "fail")
+
+    if decode_mode == "opencv":
+        img = _decode_opencv(path, jpeg_reduce)
+        return img, ("opencv" if img is not None else "fail")
+
+    # auto: turbo -> imdecode -> opencv
+    if ext in JPEG_EXTS and HAVE_TURBO:
+        img = _decode_turbo(path, jpeg_reduce)
+        if img is not None:
+            return img, "turbo"
+    img = _decode_imdecode(path, jpeg_reduce)
+    if img is not None:
+        return img, "imdecode"
+    img = _decode_opencv(path, jpeg_reduce)
+    return img, ("opencv" if img is not None else "fail")
+
+
+# ----------------------------- worker ----------------------------------------
+def _process_one(
+    path: str,
+    num_bins: int,
+    k_clusters: int,
+    resize_max: int,
+    decode_mode: str,
+    jpeg_reduce: int,
+    use_file_hash: bool,
+) -> Optional[Tuple[Tuple, Tuple, Tuple, Dict[str, float], str, str]]:
+    """Worker: decode -> resize -> color features -> pHash. Returns DB rows + stats."""
+    t0 = time.time()
+    stats = {"io_decode": 0.0, "resize": 0.0, "color": 0.0, "phash": 0.0, "total": 0.0}
+    try:
+        s = time.time()
+        img, d_used = _decode_image(path, decode_mode, jpeg_reduce)
+        if img is None:
+            return None
+        stats["io_decode"] += time.time() - s
+
+        h0, w0 = img.shape[:2]
+        ch = 1 if img.ndim == 2 else img.shape[2]
+
+        # Optional resize for feature extraction
+        s = time.time()
+        max_side = max(h0, w0)
+        if resize_max and max_side > resize_max:
+            scale = float(resize_max) / float(max_side)
+            nh, nw = int(round(h0 * scale)), int(round(w0 * scale))
+            img_feat = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+        else:
+            img_feat = img
+        stats["resize"] += time.time() - s
+
+        # Stable image id from absolute path (fast)
+        image_id = hashlib.md5(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
+        fhash = _file_hash_stream(path) if use_file_hash else None
+
+        # Color features
+        s = time.time()
+        ca = ColorAnalyzer(k_clusters=k_clusters, random_state=42)
+        cf = ca.extract_color_features(img_feat, num_bins=num_bins, num_dominant=k_clusters)
+        stats["color"] += time.time() - s
+
+        # pHash (on resized image)
+        s = time.time()
+        ph = compute_phash(img_feat)
+        stats["phash"] += time.time() - s
+
+        st = os.stat(path)
+        meta = (
+            image_id,
+            os.path.basename(path),
+            os.path.abspath(path),
+            int(st.st_size),
+            int(w0),
+            int(h0),
+            int(ch),
+            fhash,
+            None,
+            datetime.datetime.fromtimestamp(st.st_ctime).isoformat(timespec="seconds"),
+            _now_iso(),
+        )
+
+        color_row = (
+            image_id,
+            json.dumps(cf["dominant_colors"]),
+            json.dumps(cf["hsv_histogram"]),
+            json.dumps(cf["bgr_histogram"]),
+            json.dumps(cf["color_stats"]),
+        )
+
+        custom = {"phash_hex": hex(ph)}
+        adv_row = (image_id, json.dumps(custom))  # (image_id, custom_features)
+
+        stats["total"] = time.time() - t0
+        return meta, color_row, adv_row, stats, d_used, Path(path).suffix.lower()
+    except Exception as e:
+        # Keep pipeline robust; just log and continue
+        log.warning(f"[worker-error] {path}: {e}")
+        return None
+
+
+# ----------------------------- DB wrapper ------------------------------------
 class ImageDatabase:
-    """
-    Relationale Datenbank für Image Metadata und Features
-    unique image-IDs, Metadaten, Dateilinks
-    """
-    
-    def __init__(self, db_path: str = "image_recommender.db"):
-        """
-        Initialisiert die Image Database
-        
-        Args:
-            db_path (str): Pfad zur SQLite Datenbank
-        """
+    """Relational store for images & features (SQLite/WAL). Fast bulk ingest with pools and TurboJPEG."""
+
+    def __init__(self, db_path: str = "image_recommender.db") -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cur = self.conn.cursor()
+        # Performance PRAGMAs
         cur.execute("PRAGMA journal_mode=WAL;")
         cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("PRAGMA mmap_size=3000000000;")
+        cur.execute("PRAGMA cache_size=-200000;")
+        cur.execute("PRAGMA busy_timeout=60000;")
         self.conn.commit()
-        self.color_analyzer = ColorAnalyzer()
-        self.feature_extractor = ImageFeatureExtractor()
-        
-        # Logging setup
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-        
-        # Database initialisieren
         self._create_tables()
-        self.logger.info(f"Image Database initialisiert: {db_path}")
-    
-    def _create_tables(self):
-        """Erstellt die benötigten Tabellen"""
-        #with sqlite3.connect(self.db_path) as conn:
-            #cursor = conn.cursor()
-        cursor = self.conn.cursor()
-        # Haupttabelle für Image Metadaten
-        cursor.execute("""
+        log.info(f"Image database initialized: {db_path}")
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    # ----------------------------- schema ------------------------------------
+    def _create_tables(self) -> None:
+        c = self.conn.cursor()
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS images (
-                image_id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                filepath TEXT NOT NULL,
-                file_size INTEGER,
-                width INTEGER,
-                height INTEGER,
-                channels INTEGER,
-                file_hash TEXT UNIQUE,
+                image_id     TEXT PRIMARY KEY,
+                filename     TEXT NOT NULL,
+                filepath     TEXT NOT NULL,
+                file_size    INTEGER,
+                width        INTEGER,
+                height       INTEGER,
+                channels     INTEGER,
+                file_hash    TEXT UNIQUE,
                 photographer TEXT,
                 created_date TEXT,
-                added_to_db TEXT,
+                added_to_db  TEXT,
                 UNIQUE(filepath)
-             )
-        """)    
-            
-            # Tabelle für Color Features (von ColorAnalyzer)
-        cursor.execute("""
+            )
+            """
+        )
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS color_features (
-                image_id TEXT PRIMARY KEY,
-                dominant_colors TEXT,  -- JSON serialized
-                hsv_histogram TEXT,    -- JSON serialized
-                bgr_histogram TEXT,    -- JSON serialized
-                color_stats TEXT,      -- JSON serialized (mean, std, etc.)
+                image_id        TEXT PRIMARY KEY,
+                dominant_colors TEXT,
+                hsv_histogram   TEXT,
+                bgr_histogram   TEXT,
+                color_stats     TEXT,
                 FOREIGN KEY (image_id) REFERENCES images (image_id)
             )
-        """)
-            
-        # Tabelle für zusätzliche Features (für Texture, Deep Learning Embeddings, etc.)
-        cursor.execute("""
+            """
+        )
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS advanced_features (
-                image_id TEXT PRIMARY KEY,
-                texture_features TEXT,     -- JSON serialized
-                deep_embeddings TEXT,      -- JSON serialized (für später)
-                custom_features TEXT,      -- JSON serialized
+                image_id        TEXT PRIMARY KEY,
+                texture_features TEXT,
+                deep_embeddings  BLOB,
+                custom_features  TEXT,
+                deep_dim         INTEGER,
                 FOREIGN KEY (image_id) REFERENCES images (image_id)
             )
-        """)
-            
-        #conn.commit()
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_path ON images(filepath);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_hash ON images(file_hash);")
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_images_path ON images(filepath);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_images_hash ON images(file_hash);")
         self.conn.commit()
-        self.logger.info("Database Tabellen erstellt/überprüft")
 
-    def _now_iso(self) -> str:
-        return datetime.datetime.now().isoformat(timespec="seconds")
+    # ----------------------------- getters -----------------------------------
+    def get_all_image_ids(self) -> List[str]:
+        """Return all image_ids."""
+        c = self.conn.cursor()
+        c.execute("SELECT image_id FROM images")
+        return [r[0] for r in c.fetchall()]
 
-    def _file_hash(self, path: str, block_size: int = 1 << 20) -> str:
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(block_size), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    
-    def generate_image_id(self, filepath: str) -> str:
-        """
-        Generiert eindeutige image_id aus Dateipfad
-        
-        Args:
-            filepath (str): Pfad zur Bilddatei
-            
-        Returns:
-            str: Eindeutige Image ID
-        """
-        # Verwende MD5 Hash des Dateipfads für eindeutige ID
-        return hashlib.md5(filepath.encode()).hexdigest()[:16]
-    
-    def extract_metadata(self, filepath: str) -> Dict:
-        """
-        Extrahiert Metadaten aus Bilddatei
-        
-        Args:
-            filepath (str): Pfad zur Bilddatei
-            
-        Returns:
-            Dict: Metadaten Dictionary
-        """
-        try:
-            # Datei-Metadaten
-            file_stats = os.stat(filepath)
-            
-            # Bild laden für Dimensionen
-            image = cv2.imread(filepath)
-            if image is None:
-                raise ValueError(f"Kann Bild nicht laden: {filepath}")
-            
-            # File Hash für Duplikatserkennung
-            #with open(filepath, 'rb') as f:
-                #file_hash = hashlib.md5(f.read()).hexdigest()
+    def get_image_metadata(self, image_id: str) -> Optional[Dict[str, Any]]:
+        """Return metadata row from images table as dict."""
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        c = con.cursor()
+        c.execute("SELECT * FROM images WHERE image_id=?", (image_id,))
+        row = c.fetchone()
+        con.close()
+        return dict(row) if row else None
 
-            file_hash = self._file_hash(filepath)
-
-            metadata = {
-                'filename': os.path.basename(filepath),
-                'filepath': os.path.abspath(filepath),
-                'file_size': file_stats.st_size,
-                'width': image.shape[1],
-                'height': image.shape[0],
-                'channels': image.shape[2] if len(image.shape) == 3 else 1,
-                'file_hash': file_hash,
-                'photographer': None,
-                #'created_date': datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
-                #'added_to_db': datetime.now().isoformat()
-                'created_date': datetime.datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
-                'added_to_db': datetime.datetime.now().isoformat()
-            }
-            
-            return metadata
-            
-        except Exception as e:
-            self.logger.error(f"Fehler beim Extrahieren von Metadaten für {filepath}: {e}")
+    def get_color_features(self, image_id: str) -> Optional[Dict[str, Any]]:
+        """Return color features for an image_id as dict."""
+        con = sqlite3.connect(self.db_path)
+        c = con.cursor()
+        c.execute(
+            "SELECT dominant_colors,hsv_histogram,bgr_histogram,color_stats FROM color_features WHERE image_id=?",
+            (image_id,),
+        )
+        row = c.fetchone()
+        con.close()
+        if not row:
             return None
-    
-    def extract_color_features(self, image: np.ndarray, image_id: str) -> Dict:
-        """
-        Extrahiert Farbfeatures mit deiner ColorAnalyzer Klasse
-        
-        Args:
-            image (np.ndarray): Geladenes Bild
-            image_id (str): Image ID
-            
-        Returns:
-            Dict: Color Features
-        """
-        try:
-            # Dominante Farben (aus deiner Implementierung)
-            dominant_colors = self.color_analyzer.get_dominant_colors(image)
-            
-            # HSV Histogramm berechnen
-            hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-            hsv_hist = []
-            for i in range(3):
-                hist = cv2.calcHist([hsv_image], [i], None, [256], [0, 256])
-                hsv_hist.append(cv2.normalize(hist, hist).flatten().tolist())
-            
-            # BGR Histogramm berechnen
-            bgr_hist = []
-            for i in range(3):
-                hist = cv2.calcHist([image], [i], None, [256], [0, 256])
-                bgr_hist.append(cv2.normalize(hist, hist).flatten().tolist())
-            
-            # Farbstatistiken
-            color_stats = {
-                'mean_bgr': np.mean(image, axis=(0, 1)).tolist(),
-                'std_bgr': np.std(image, axis=(0, 1)).tolist(),
-                'brightness': np.mean(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-            }
-            
-            features = {
-                'dominant_colors': dominant_colors.tolist(),
-                'hsv_histogram': hsv_hist,
-                'bgr_histogram': bgr_hist,
-                'color_stats': color_stats
-            }
-            
-            return features
-            
-        except Exception as e:
-            self.logger.error(f"Fehler beim Extrahieren von Color Features für {image_id}: {e}")
-            return None
-    
-    def extract_advanced_features(self, image: np.ndarray, image_id: str) -> Dict:
-        """
-        Extrahiert erweiterte Features (Texture, etc.)
-        
-        Args:
-            image (np.ndarray): Geladenes Bild
-            image_id (str): Image ID
-            
-        Returns:
-            Dict: Advanced Features
-        """
-        try:
-            # Texture Features
-            texture_features = self.feature_extractor.extract_texture_features(image)
-            
-            features = {
-                'texture_features': texture_features,
-                'deep_embeddings': None,  # Placeholder für später
-                'custom_features': None   # Placeholder für später
-            }
-            
-            return features
-            
-        except Exception as e:
-            self.logger.error(f"Fehler beim Extrahieren von Advanced Features für {image_id}: {e}")
-            return None
-    
-    def add_image(self, path: str) -> Optional[str]:
-        """
-        Insert/Upsert an image:
-        - read metadata
-        - compute & persist color features (histograms + dominant colors + stats)
-        - compute & persist pHash in advanced_features.custom_features
-        Returns image_id (str) or None on failure.
-        """
-        try:
-            path = os.path.abspath(path)
-            if not os.path.exists(path):
-                logger.warning(f"Path does not exist: {path}")
-                return None
+        return {
+            "dominant_colors": json.loads(row[0]),
+            "hsv_histogram": json.loads(row[1]),
+            "bgr_histogram": json.loads(row[2]),
+            "color_stats": json.loads(row[3]),
+        }
 
-            img = cv2.imread(path)
-            if img is None:
-                logger.warning(f"Cannot read image: {path}")
-                return None
+    def get_database_stats(self) -> Dict[str, Any]:
+        """Return counts & DB file size (MB)."""
+        c = self.conn.cursor()
+        c.execute("SELECT COUNT(*) FROM images")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM color_features")
+        cf = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM advanced_features")
+        af = c.fetchone()[0]
+        size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        return {
+            "total_images": total,
+            "color_features_count": cf,
+            "advanced_features_count": af,
+            "database_size_mb": size / (1024 * 1024),
+        }
 
-            # --- metadata ---
-            st = os.stat(path)
-            h, w = img.shape[:2]
-            ch = 1 if img.ndim == 2 else img.shape[2]
-            fhash = self._file_hash(path)
-            fname = os.path.basename(path)
-            cur = self.conn.cursor()
-            cur.execute("SELECT image_id FROM images WHERE filepath=? OR file_hash=?", (path, fhash))
-            row = cur.fetchone()
-            if row:
-                image_id = row[0]
-            else:
-                image_id = fhash[:16]  # stable short id
-            # image_id = fhash[:16]  # stable short id
+    # ----------------------------- ingest ------------------------------------
+    def bulk_add_directory(
+        self,
+        directory: str,
+        recursive: bool = True,
+        workers: Optional[int] = None,
+        pool: str = "thread",
+        batch_size: int = 2000,
+        num_bins: int = 32,
+        k_clusters: int = 3,
+        resize_max: int = 256,
+        decode_mode: str = "auto",
+        jpeg_reduce: int = 8,
+        use_file_hash: bool = False,
+        log_every: int = 500,
+    ) -> Dict[str, Any]:
+        """Bulk ingest a directory of images with parallel decode + feature extraction."""
+        root = Path(directory)
+        if not root.exists():
+            log.error(f"Directory not found: {directory}")
+            return {"added": 0, "errors": 0}
 
-            cur = self.conn.cursor()
+        # Collect files (skip resource forks)
+        it = root.rglob("*") if recursive else root.iterdir()
+        files: List[str] = []
+        for p in it:
+            if not p.is_file():
+                continue
+            if p.name.startswith("._") or p.name == ".DS_Store":
+                continue
+            if p.suffix.lower() in ALLOWED_EXTS:
+                files.append(str(p))
 
-            # images (UPSERT by image_id)
-            cur.execute("""
+        n_files = len(files)
+        n_jpeg = sum(1 for f in files if Path(f).suffix.lower() in JPEG_EXTS)
+        n_other = n_files - n_jpeg
+        log.info(
+            f"Scanning {directory}: {n_files} files (jpeg={n_jpeg}, other={n_other}), "
+            f"decode={decode_mode}, jpeg_reduce={jpeg_reduce}, pool={pool}"
+        )
+        if n_files == 0:
+            return {"added": 0, "errors": 0}
+
+        # Worker defaults
+        cpu = os.cpu_count() or 8
+        if pool == "thread":
+            if workers is None:
+                workers = min(64, 2 * cpu)
+        else:
+            if workers is None:
+                workers = min(16, cpu)
+
+        # SQL upserts
+        SQL_IMG = """
             INSERT INTO images (image_id, filename, filepath, file_size, width, height, channels, file_hash, photographer, created_date, added_to_db)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_id) DO UPDATE SET
-                filename=excluded.filename,
-                filepath=excluded.filepath,
-                file_size=excluded.file_size,
-                width=excluded.width,
-                height=excluded.height,
-                channels=excluded.channels,
-                file_hash=excluded.file_hash
-            """, (image_id, fname, path, int(st.st_size), int(w), int(h), int(ch), fhash, self._now_iso(), self._now_iso()))
-
-            # --- color features (32 Bins, 3 dominants) ---
-            ca = ColorAnalyzer(k_clusters=3, random_state=42)
-            cf = ca.extract_color_features(img, num_bins=32, num_dominant=3)
-
-            cur.execute("""
+                filename=excluded.filename, filepath=excluded.filepath, file_size=excluded.file_size,
+                width=excluded.width, height=excluded.height, channels=excluded.channels, file_hash=excluded.file_hash
+        """
+        SQL_COLOR = """
             INSERT INTO color_features (image_id, dominant_colors, hsv_histogram, bgr_histogram, color_stats)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(image_id) DO UPDATE SET
-                dominant_colors=excluded.dominant_colors,
-                hsv_histogram=excluded.hsv_histogram,
-                bgr_histogram=excluded.bgr_histogram,
-                color_stats=excluded.color_stats
-            """, (image_id,
-                    json.dumps(cf["dominant_colors"]),
-                    json.dumps(cf["hsv_histogram"]),
-                    json.dumps(cf["bgr_histogram"]),
-                    json.dumps(cf["color_stats"])) )
+                dominant_colors=excluded.dominant_colors, hsv_histogram=excluded.hsv_histogram,
+                bgr_histogram=excluded.bgr_histogram, color_stats=excluded.color_stats
+        """
+        SQL_ADV = """
+            INSERT INTO advanced_features (image_id, texture_features, deep_embeddings, custom_features, deep_dim)
+            VALUES (?, NULL, NULL, ?, NULL)
+            ON CONFLICT(image_id) DO UPDATE SET custom_features=excluded.custom_features
+        """
 
-            # --- pHash als "custom_features" ablegen ---
-            ph = compute_phash(img)
-            custom = {"phash_hex": hex(ph)}
-            cur.execute("""
-            INSERT INTO advanced_features (image_id, texture_features, deep_embeddings, custom_features)
-            VALUES (?, NULL, NULL, ?)
-            ON CONFLICT(image_id) DO UPDATE SET
-                custom_features=excluded.custom_features
-            """, (image_id, json.dumps(custom)))
+        # Timers & counters
+        acc = {"io_decode": 0.0, "resize": 0.0, "color": 0.0, "phash": 0.0, "total": 0.0}
+        nstat = 0
+        errors = 0
+        used_decoder_counts = {"turbo": 0, "imdecode": 0, "opencv": 0, "skip": 0}
+        ext_counts = {"jpeg": 0, "other": 0}
+
+        t0 = time.time()
+        cur = self.conn.cursor()
+        cur.execute("BEGIN")
+        buf_img: List[Tuple] = []
+        buf_color: List[Tuple] = []
+        buf_adv: List[Tuple] = []
+
+        Executor = ThreadPoolExecutor if pool == "thread" else ProcessPoolExecutor
+        init = None if pool == "thread" else _init_worker
+
+        try:
+            with Executor(max_workers=workers, initializer=init) as ex:
+                futs = [
+                    ex.submit(
+                        _process_one,
+                        p,
+                        num_bins,
+                        k_clusters,
+                        resize_max,
+                        decode_mode,
+                        jpeg_reduce,
+                        use_file_hash,
+                    )
+                    for p in files
+                ]
+
+                for i, fut in enumerate(as_completed(futs), 1):
+                    res = fut.result()
+                    if not res:
+                        errors += 1
+                        continue
+                    meta, color_row, adv_row, stats, d_used, ext = res
+
+                    # Counters
+                    used_decoder_counts[d_used] = used_decoder_counts.get(d_used, 0) + 1
+                    if ext in JPEG_EXTS:
+                        ext_counts["jpeg"] += 1
+                    else:
+                        ext_counts["other"] += 1
+
+                    buf_img.append(meta)
+                    buf_color.append(color_row)
+                    buf_adv.append(adv_row)
+                    for k in acc:
+                        acc[k] += stats[k]
+                    nstat += 1
+
+                    if len(buf_img) >= batch_size:
+                        cur.executemany(SQL_IMG, buf_img)
+                        cur.executemany(SQL_COLOR, buf_color)
+                        cur.executemany(SQL_ADV, buf_adv)
+                        buf_img.clear()
+                        buf_color.clear()
+                        buf_adv.clear()
+                        self.conn.commit()
+                        cur.execute("BEGIN")
+
+                    if log_every and (i % log_every == 0):
+                        now = time.time()
+                        elapsed_total = now - t0
+                        imgs_s = nstat / max(1e-6, elapsed_total)
+                        remaining = max(0, n_files - nstat)
+                        eta_s = remaining / max(1e-6, imgs_s)
+                        eta_str = _fmt_dur(eta_s)
+                        elapsed_str = _fmt_dur(elapsed_total)
+                        eta_clock = (datetime.datetime.now() + datetime.timedelta(seconds=eta_s)).strftime("%H:%M:%S")
+
+                        ms = {k: (acc[k] / max(1, nstat)) * 1000.0 for k in acc}
+                        log.info(
+                            f"... {nstat}/{n_files} | {imgs_s:.1f} imgs/s | "
+                            f"elapsed {elapsed_str} | ETA {eta_str} (~{eta_clock}) | "
+                            f"avg ms/img: io {ms['io_decode']:.1f} | resize {ms['resize']:.1f} | "
+                            f"color {ms['color']:.1f} | phash {ms['phash']:.2f} | total {ms['total']:.1f}"
+                        )
+
+                # Flush remaining buffers
+                if buf_img:
+                    cur.executemany(SQL_IMG, buf_img)
+                if buf_color:
+                    cur.executemany(SQL_COLOR, buf_color)
+                if buf_adv:
+                    cur.executemany(SQL_ADV, buf_adv)
 
             self.conn.commit()
-            return image_id
-
         except Exception as e:
-            logger.error(f"add_image failed for {path}: {e}")
+            log.error(f"Bulk ingest failed: {e}")
             self.conn.rollback()
-            return None
-    
-    
-    """
-    def add_image(self, filepath: str) -> Optional[str]:
-        ""
-        Fügt ein Bild zur Datenbank hinzu
-        
-        Args:
-            filepath (str): Pfad zur Bilddatei
-            
-        Returns:
-            Optional[str]: Image ID wenn erfolgreich, None sonst
-        ""
-        try:
-            # Image ID generieren
-            image_id = self.generate_image_id(filepath)
-            
-            # Prüfen ob Bild bereits existiert
-            if self.image_exists(image_id):
-                self.logger.info(f"Bild bereits in DB: {filepath}")
-                return image_id
-            
-            # Metadaten extrahieren
-            metadata = self.extract_metadata(filepath)
-            if metadata is None:
-                return None
-            
-            # Bild laden für Feature Extraction
-            image = cv2.imread(filepath)
-            if image is None:
-                self.logger.error(f"Kann Bild nicht laden: {filepath}")
-                return None
-            
-            # Features extrahieren
-            color_features = self.extract_color_features(image, image_id)
-            advanced_features = self.extract_advanced_features(image, image_id)
-            
-            # In Datenbank speichern
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Image Metadaten speichern
-                cursor.execute(""
-                    INSERT INTO images (image_id, filename, filepath, file_size, 
-                                      width, height, channels, file_hash, 
-                                      photographer, created_date, added_to_db)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "", (image_id, metadata['filename'], metadata['filepath'],
-                     metadata['file_size'], metadata['width'], metadata['height'],
-                     metadata['channels'], metadata['file_hash'], 
-                     metadata['photographer'], metadata['created_date'],
-                     metadata['added_to_db']))
-                
-                # Color Features speichern
-                if color_features:
-                    cursor.execute(""
-                        INSERT INTO color_features (image_id, dominant_colors, 
-                                                   hsv_histogram, bgr_histogram, color_stats)
-                        VALUES (?, ?, ?, ?, ?)
-                    "", (image_id, json.dumps(color_features['dominant_colors']),
-                         json.dumps(color_features['hsv_histogram']),
-                         json.dumps(color_features['bgr_histogram']),
-                         json.dumps(color_features['color_stats'])))
-                
-                # Advanced Features speichern
-                if advanced_features:
-                    cursor.execute(""
-                        INSERT INTO advanced_features (image_id, texture_features, 
-                                                     deep_embeddings, custom_features)
-                        VALUES (?, ?, ?, ?)
-                    "", (image_id, json.dumps(advanced_features['texture_features']),
-                         json.dumps(advanced_features['deep_embeddings']),
-                         json.dumps(advanced_features['custom_features'])))
-                
-                conn.commit()
-            
-            self.logger.info(f"Bild erfolgreich hinzugefügt: {filepath} (ID: {image_id})")
-            return image_id
-            
-        except Exception as e:
-            self.logger.error(f"Fehler beim Hinzufügen von Bild {filepath}: {e}")
-            return None
-    """
-    def image_exists(self, image_id: str) -> bool:
-        """Prüft ob Bild bereits in DB existiert"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM images WHERE image_id = ?", (image_id,))
-            return cursor.fetchone() is not None
-    
-    def get_image_metadata(self, image_id: str) -> Optional[Dict]:
-        """Holt Metadaten für eine Image ID"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM images WHERE image_id = ?", (image_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-    
-    def get_color_features(self, image_id: str) -> Optional[Dict]:
-        """Holt Color Features für eine Image ID"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM color_features WHERE image_id = ?", (image_id,))
-            row = cursor.fetchone()
-            if row:
-                return {
-                    'dominant_colors': json.loads(row[1]),
-                    'hsv_histogram': json.loads(row[2]),
-                    'bgr_histogram': json.loads(row[3]),
-                    'color_stats': json.loads(row[4])
-                }
-            return None
-        
-    def get_custom_features(self, image_id: str) -> Optional[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT custom_features FROM advanced_features WHERE image_id = ?", (image_id,))
-            row = cursor.fetchone()
-            if not row or row[0] is None:
-                return None
+        finally:
             try:
-                return json.loads(row[0])
+                cur.execute("PRAGMA optimize;")
             except Exception:
-                return None
+                pass
 
-    def get_all_images(self) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT image_id, filename, filepath FROM images")
-            return [{"image_id": r[0], "filename": r[1], "filepath": r[2]} for r in cursor.fetchall()]
-    
-    def get_all_image_ids(self) -> List[str]:
-        """Holt alle Image IDs aus der Datenbank"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT image_id FROM images")
-            return [row[0] for row in cursor.fetchall()]
-    
-    def get_database_stats(self) -> Dict:
-        """Gibt Statistiken über die Datenbank zurück"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            # Anzahl Bilder
-            cursor.execute("SELECT COUNT(*) FROM images")
-            total_images = cursor.fetchone()[0]
-            
-            # Anzahl mit Color Features
-            cursor.execute("SELECT COUNT(*) FROM color_features")
-            color_features_count = cursor.fetchone()[0]
-            
-            # Anzahl mit Advanced Features
-            cursor.execute("SELECT COUNT(*) FROM advanced_features")
-            advanced_features_count = cursor.fetchone()[0]
-            
-            # Datenbankgröße
-            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
-            
-            return {
-                'total_images': total_images,
-                'color_features_count': color_features_count,
-                'advanced_features_count': advanced_features_count,
-                'database_size_mb': db_size / (1024 * 1024)
-            }
+        elapsed = time.time() - t0
+        ms = {k: (acc[k] / max(1, nstat)) * 1000.0 for k in acc}
+        thr = nstat / max(1e-6, elapsed)
+
+        log.info(
+            "Bulk ingest done: added=%d, errors=%d | avg ms/img: io %.1f | resize %.1f | color %.1f | phash %.2f | "
+            "total %.1f | throughput %.1f imgs/s | elapsed %.1fs | workers=%s pool=%s decode=%s jpeg_reduce=%s | "
+            "decoders %s | formats %s",
+            nstat,
+            errors,
+            ms["io_decode"],
+            ms["resize"],
+            ms["color"],
+            ms["phash"],
+            ms["total"],
+            thr,
+            elapsed,
+            workers,
+            pool,
+            decode_mode,
+            jpeg_reduce,
+            used_decoder_counts,
+            ext_counts,
+        )
+
+        return {
+            "added": int(nstat),
+            "errors": int(errors),
+            "avg_ms_per_step": ms,
+            "throughput_imgs_per_s": thr,
+            "elapsed_s": elapsed,
+            "decoders": used_decoder_counts,
+            "formats": ext_counts,
+        }
+
+    # -------------------- embeddings API (used by backfill) -------------------
+    def save_deep_embeddings(self, rows: List[Tuple[str, bytes, int]]) -> None:
+        """Upsert deep embeddings as BLOBs (image_id, blob, dim)."""
+        cur = self.conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO advanced_features (image_id, texture_features, deep_embeddings, custom_features, deep_dim)
+            VALUES (?, NULL, ?, NULL, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                deep_embeddings=excluded.deep_embeddings,
+                deep_dim=excluded.deep_dim
+            """,
+            rows,
+        )
+        self.conn.commit()
 
 
-class ImageLoader:
-    """
-    Generator für effizientes Laden von Bildern (Projektanforderung)
-    Funktioniert mit deinem aktuellen Ordner mit 5 Bildern
-    """
-    
-    def __init__(self, image_database: ImageDatabase):
-        """
-        Initialisiert den ImageLoader
-        
-        Args:
-            image_database (ImageDatabase): Referenz zur Database
-        """
-        self.db = image_database
-        self.logger = logging.getLogger(__name__)
-    
-    def scan_directory(self, directory_path: str, extensions: List[str] = None) -> List[str]:
-        """
-        Scannt Verzeichnis nach Bilddateien
-        
-        Args:
-            directory_path (str): Pfad zum Bildverzeichnis
-            extensions (List[str]): Erlaubte Dateierweiterungen
-            
-        Returns:
-            List[str]: Liste der gefundenen Bilddateien
-        """
-        if extensions is None:
-            extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
-        
-        image_files = []
-        directory = Path(directory_path)
-        
-        if not directory.exists():
-            self.logger.error(f"Verzeichnis existiert nicht: {directory_path}")
-            return image_files
-        
-        for ext in extensions:
-            image_files.extend(directory.glob(f"*{ext}"))
-            image_files.extend(directory.glob(f"*{ext.upper()}"))
-        
-        self.logger.info(f"Gefunden: {len(image_files)} Bilder in {directory_path}")
-        return [str(f) for f in image_files]
-    
-    def load_images_generator(self, image_paths: List[str]) -> Generator[Tuple[str, np.ndarray, str], None, None]:
-        """
-        Generator für das Laden von Bildern
-        
-        Args:
-            image_paths (List[str]): Liste der Bildpfade
-            
-        Yields:
-            Tuple[str, np.ndarray, str]: (image_id, image_array, filepath)
-        """
-        for filepath in image_paths:
-            try:
-                # Bild laden
-                image = cv2.imread(filepath)
-                if image is None:
-                    self.logger.warning(f"Kann Bild nicht laden: {filepath}")
-                    continue
-                
-                # Image ID generieren
-                image_id = self.db.generate_image_id(filepath)
-                
-                yield image_id, image, filepath
-                
-            except Exception as e:
-                self.logger.error(f"Fehler beim Laden von {filepath}: {e}")
-                continue
+# ----------------------------- CLI -------------------------------------------
+if __name__ == "__main__":
+    import argparse
 
-# Praktische Hilfsfunktionen
-def initialize_database_with_images(image_directory: str, db_path: str = "image_recommender.db") -> ImageDatabase:
-    """
-    Convenience-Funktion zum Initialisieren der DB mit deinen Bildern
-    
-    Args:
-        image_directory (str): Pfad zu deinem Ordner mit 5 Bildern
-        db_path (str): Pfad zur Datenbank
-        
-    Returns:
-        ImageDatabase: Initialisierte Datenbank
-    """
-    # Database und Loader erstellen
-    db = ImageDatabase(db_path)
-    loader = ImageLoader(db)
-    
-    # Bilder hinzufügen
-    #stats = loader.bulk_add_directory(image_directory)
-    
-    print(f"Datenbank initialisiert!")
-    print(f"Hinzugefügt: {stats['added']}, Übersprungen: {stats['skipped']}, Fehler: {stats['errors']}")
-    print(f"DB Stats: {db.get_database_stats()}")
-    
-    return db
+    ap = argparse.ArgumentParser(description="Fast bulk ingest of images into SQLite (features+pHash).")
+    ap.add_argument("--ingest", type=str, required=True, help="Root directory (recursive).")
+    ap.add_argument("--db", type=str, default="image_recommender.db", help="SQLite DB path.")
+    ap.add_argument("--workers", type=int, default=None, help="Number of workers (auto if omitted).")
+    ap.add_argument("--pool", type=str, choices=["thread", "process"], default="thread", help="Thread vs process pool.")
+    ap.add_argument("--decode-mode", type=str, choices=["auto", "turbo", "imdecode", "opencv"], default="auto")
+    ap.add_argument("--jpeg-reduce", type=int, choices=[1, 2, 4, 8], default=8, help="Turbo/OpenCV reduced decode factor.")
+    ap.add_argument("--batch-size", type=int, default=2000, help="DB batch size for executemany().")
+    ap.add_argument("--bins", type=int, default=32, help="Histogram bins per channel.")
+    ap.add_argument("--k", type=int, default=3, help="Number of dominant colors (k-means).")
+    ap.add_argument("--resize", type=int, default=256, help="Max side for feature extraction (pixels).")
+    ap.add_argument("--use-file-hash", action="store_true", help="Compute MD5 of file contents (slower).")
+    ap.add_argument("--log-every", type=int, default=1000, help="Progress log interval (#images).")
+    args = ap.parse_args()
+
+    db = ImageDatabase(args.db)
+    stats = db.bulk_add_directory(
+        directory=args.ingest,
+        recursive=True,
+        workers=args.workers,
+        pool=args.pool,
+        batch_size=args.batch_size,
+        num_bins=args.bins,
+        k_clusters=args.k,
+        resize_max=args.resize,
+        decode_mode=args.decode_mode,
+        jpeg_reduce=args.jpeg_reduce,
+        use_file_hash=args.use_file_hash,
+        log_every=args.log_every,
+    )
+    print("Done:", stats, "| DB:", db.get_database_stats())
