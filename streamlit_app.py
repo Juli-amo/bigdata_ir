@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import time
 from pathlib import Path
 from typing import Optional
@@ -30,9 +32,17 @@ st.title("🔎 Image Recommender — Demo UI")
 # --------------------------- Helper functions --------------------------------
 @st.cache_resource(show_spinner=False)
 def load_recommender(db_path: str) -> ImageRecommender:
-    """Create & cache the recommender (builds indices once)."""
+    """(Legacy) Create & cache the recommender without on-disk ANN cache."""
     db = ImageDatabase(db_path=db_path)
-    rec = ImageRecommender(database=db)  # ANN threshold handled inside
+    rec = ImageRecommender(database=db)
+    return rec
+
+
+@st.cache_resource(show_spinner="Building/loading indices …")
+def get_recommender(db_path: str = "image_recommender.db", cache_dir: str = ".cache") -> ImageRecommender:
+    """Create & cache the recommender with HNSW on-disk cache."""
+    db = ImageDatabase(db_path=db_path)
+    rec = ImageRecommender(database=db, cache_dir=cache_dir)
     return rec
 
 
@@ -108,13 +118,8 @@ def _graceful_exit(delay_s: float = 0.4) -> None:
         st.warning(f"Cleanup issue: {e}")
     time.sleep(delay_s)
     try:
-        import os
-        import signal
-
         os.kill(os.getpid(), signal.SIGTERM)
     except Exception:
-        import os
-
         os._exit(0)
 
 
@@ -123,6 +128,8 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     db_path = st.text_input("SQLite database", value="image_recommender.db")
+    cache_dir = st.text_input("Index cache directory", value=".cache")
+
     c1, c2 = st.columns(2)
     with c1:
         reload_btn = st.button("🔄 Load recommender", use_container_width=True)
@@ -141,9 +148,10 @@ with st.sidebar:
 
 # -------------------------- Load / reload recommender ------------------------
 if "rec" not in st.session_state or reload_btn:
-    with st.spinner("Loading recommender & building indices ..."):
+    with st.spinner("Loading recommender & building/loading indices ..."):
         try:
-            st.session_state.rec = load_recommender(db_path)
+            # Use cached HNSW indices from disk
+            st.session_state.rec = get_recommender(db_path=db_path, cache_dir=cache_dir)
         except Exception as e:
             st.error(f"Failed to load recommender: {e}")
             st.stop()
@@ -199,75 +207,139 @@ if rec.get_system_stats().get("deep_index_size", 0) == 0:
         "Run the backfill first: `python EmbedBackfill.py --db image_recommender.db`."
     )
 
+# ------------------------------ Query mode (tabs) ----------------------------
+st.subheader("2) Choose query mode")
+tab_single, tab_multi = st.tabs(["Single query", "Multi-query"])
 
-# ------------------------------ Upload & search ------------------------------
-st.subheader("2) Upload image")
+with tab_single:
+    uploaded_single = st.file_uploader(
+        "Drag & drop or choose a file (jpg/png/…)",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+        key="u_single",
+    )
+    go_single = st.button("🚀 Run search (single)", type="primary", use_container_width=True)
 
-uploaded = st.file_uploader(
-    "Drag & drop or choose a file (jpg/png/…)",
-    type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
-)
+    if go_single:
+        q_bgr = bgr_from_upload(uploaded_single)
+        if q_bgr is None:
+            st.error("Could not read the uploaded image.")
+            st.stop()
 
-go = st.button(
-    "🚀 Run search", type="primary", use_container_width=True, disabled=(uploaded is None)
-)
+        q_rgb = bgr_to_rgb(q_bgr)
 
-if go:
-    q_bgr = bgr_from_upload(uploaded)
-    if q_bgr is None:
-        st.error("Could not read the uploaded image.")
-        st.stop()
+        t0 = time.time()
+        try:
+            results: list[dict] = rec.find_similar_images(q_bgr, top_k=topk, candidates=candidates)
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            st.stop()
+        elapsed = time.time() - t0
 
-    q_rgb = bgr_to_rgb(q_bgr)
+        st.subheader("3) Results")
+        st.markdown("**Query**")
+        st.image(q_rgb, caption=f"Upload • {uploaded_single.name}", use_container_width=True)
 
-    # Execute query (measure time)
-    t0 = time.time()
-    try:
-        results: list[dict] = rec.find_similar_images(q_bgr, top_k=topk, candidates=candidates)
-    except Exception as e:
-        st.error(f"Search failed: {e}")
-        st.stop()
-    elapsed = time.time() - t0
+        st.markdown(f"**Top-{topk} similar images**  ·  Duration: {elapsed:.3f}s")
+        cols = st.columns(topk)
+        for i, r in enumerate(results[:topk]):
+            meta = r.get("metadata") or {}
+            fp = meta.get("filepath", "")
+            rgb = load_rgb_from_path(fp)
+            cap = f"{meta.get('filename', '?')} • Score: {r.get('similarity_score', 0):.2f}"
+            with cols[i]:
+                if rgb is not None:
+                    st.image(rgb, caption=cap, use_container_width=True)
+                else:
+                    st.write("⚠️ Could not load result image.")
+                    st.caption(cap)
 
-    # --------------------------- Results UI ----------------------------------
-    st.subheader("3) Results")
+                with st.expander("Details", expanded=False):
+                    ds = r.get("detailed_scores") or {}
+                    st.json(
+                        {
+                            "color_similarity": round(ds.get("color_similarity", 0.0), 3),
+                            "embedding_similarity": round(ds.get("embedding_similarity", 0.0), 3),
+                            "custom_similarity": round(ds.get("custom_similarity", 0.0), 3),
+                        }
+                    )
+                    st.json(
+                        {
+                            "image_id": r.get("image_id"),
+                            "path": fp,
+                            "size_bytes": meta.get("file_size"),
+                            "shape": (meta.get("height"), meta.get("width"), meta.get("channels")),
+                        }
+                    )
 
-    # Query preview
-    st.markdown("**Query**")
-    st.image(q_rgb, caption=f"Upload • {uploaded.name}", width=360)
+with tab_multi:
+    uploads = st.file_uploader(
+        "Drag & drop / choose multiple files",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+        accept_multiple_files=True,
+        key="u_multi",
+    )
+    combine = st.selectbox("Combine queries", ["mean", "max"], index=0)
+    go_multi = st.button("🚀 Run search (multi)", type="primary", use_container_width=True)
 
-    # Top-k cards
-    st.markdown(f"**Top-{topk} similar images**  ·  Duration: {elapsed:.3f}s")
-    cols = st.columns(topk)
-    for i, r in enumerate(results[:topk]):
-        meta = r.get("metadata") or {}
-        fp = meta.get("filepath", "")
-        rgb = load_rgb_from_path(fp)
-        cap = f"{meta.get('filename', '?')} • Score: {r.get('similarity_score', 0):.2f}"
-        with cols[i]:
-            if rgb is not None:
-                st.image(rgb, caption=cap, use_container_width=True)
-            else:
-                st.write("⚠️ Could not load result image.")
-                st.caption(cap)
+    if go_multi:
+        files = uploads or []
+        imgs_bgr: list[np.ndarray] = []
+        for f in files:
+            im = bgr_from_upload(f)
+            if im is not None:
+                imgs_bgr.append(im)
+        if not imgs_bgr:
+            st.error("Please upload at least one image.")
+            st.stop()
 
-            with st.expander("Details", expanded=False):
-                ds = r.get("detailed_scores") or {}
-                st.json(
-                    {
-                        "color_similarity": round(ds.get("color_similarity", 0.0), 3),
-                        "embedding_similarity": round(ds.get("embedding_similarity", 0.0), 3),
-                        "custom_similarity": round(ds.get("custom_similarity", 0.0), 3),
-                    }
-                )
-                st.json(
-                    {
-                        "image_id": r.get("image_id"),
-                        "path": fp,
-                        "size_bytes": meta.get("file_size"),
-                        "shape": (meta.get("height"), meta.get("width"), meta.get("channels")),
-                    }
-                )
+        t0 = time.time()
+        try:
+            results = rec.find_similar_multi_input(
+                imgs_bgr, top_k=topk, candidates=candidates, combine=combine
+            )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            st.stop()
+        elapsed = time.time() - t0
+
+        st.subheader("3) Results")
+        st.markdown("**Queries**")
+        qcols = st.columns(min(6, len(imgs_bgr)))
+        for i, im_bgr in enumerate(imgs_bgr[:6]):
+            with qcols[i]:
+                st.image(bgr_to_rgb(im_bgr), caption=f"Query {i+1}", use_container_width=True)
+
+        st.markdown(f"**Top-{topk} similar images**  ·  Duration: {elapsed:.3f}s")
+        cols = st.columns(topk)
+        for i, r in enumerate(results[:topk]):
+            meta = r.get("metadata") or {}
+            fp = meta.get("filepath", "")
+            rgb = load_rgb_from_path(fp)
+            cap = f"{meta.get('filename', '?')} • Score: {r.get('similarity_score', 0):.2f}"
+            with cols[i]:
+                if rgb is not None:
+                    st.image(rgb, caption=cap, use_container_width=True)
+                else:
+                    st.write("⚠️ Could not load result image.")
+                    st.caption(cap)
+
+                with st.expander("Details", expanded=False):
+                    ds = r.get("detailed_scores") or {}
+                    st.json(
+                        {
+                            "color_similarity": round(ds.get("color_similarity", 0.0), 3),
+                            "embedding_similarity": round(ds.get("embedding_similarity", 0.0), 3),
+                            "custom_similarity": round(ds.get("custom_similarity", 0.0), 3),
+                        }
+                    )
+                    st.json(
+                        {
+                            "image_id": r.get("image_id"),
+                            "path": fp,
+                            "size_bytes": meta.get("file_size"),
+                            "shape": (meta.get("height"), meta.get("width"), meta.get("channels")),
+                        }
+                    )
 
 # ------------------------------ Footer ---------------------------------------
 st.write("---")
