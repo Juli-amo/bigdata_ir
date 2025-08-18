@@ -236,7 +236,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 def cmd_query(args: argparse.Namespace) -> None:
     """Top-k search for a single query image."""
     db = ImageDatabase(db_path=args.db)
-    rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold)
+    rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold, cache_dir=args.cache_dir)
     rec.weights = _normalize_weights(
         {"color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom}
     )
@@ -257,7 +257,7 @@ def cmd_query(args: argparse.Namespace) -> None:
 def cmd_query_multi(args: argparse.Namespace) -> None:
     """Top-k search for multiple query images (score fusion)."""
     db = ImageDatabase(db_path=args.db)
-    rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold)
+    rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold, cache_dir=args.cache_dir)
     rec.weights = _normalize_weights(
         {"color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom}
     )
@@ -441,6 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--w-custom", type=float, default=0.2)
     sp.add_argument("--show", action="store_true")
     sp.add_argument("--save-grid", dest="save_grid", default=None)
+    sp.add_argument("--cache-dir", default=None)
     sp.set_defaults(func=cmd_query)
 
     # query-multi
@@ -455,6 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--w-custom", type=float, default=0.2)
     sp.add_argument("--show", action="store_true")
     sp.add_argument("--save-grid", dest="save_grid", default=None)
+    sp.add_argument("--cache-dir", default=None)
     sp.set_defaults(func=cmd_query_multi)
 
     # stats

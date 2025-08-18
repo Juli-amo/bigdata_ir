@@ -1,4 +1,6 @@
-import json
+from __future__ import annotations
+
+import json, os
 import logging
 import sqlite3
 import time
@@ -148,6 +150,7 @@ class ApproximateNearestNeighbor:
     HNSW (hnswlib) with safe fallback to NumPy cosine.
     - Builds HNSW only if N > use_ann_threshold
     - Ensures ef_search >= k for queries
+    - Optional on-disk cache: saves/loads HNSW and id mapping if cache_dir is set
     """
 
     def __init__(
@@ -156,6 +159,8 @@ class ApproximateNearestNeighbor:
         M: int = 16,
         ef_construction: int = 200,
         ef_search: int = 200,
+        cache_dir: Optional[str] = None,
+        name: str = "cheap",
     ):
         """Store HNSW parameters and allocate holders for data/index."""
         self.use_ann_threshold = int(use_ann_threshold)
@@ -168,49 +173,146 @@ class ApproximateNearestNeighbor:
         self.X: Optional[np.ndarray] = None
         self._use_hnsw = False
         self._norms: Optional[np.ndarray] = None
-        self.name = "cheap"
+        self.name = name
         self.ann = None  # hnswlib.Index, if available
 
+        self.cache_dir = cache_dir  # directory for .hnsw and _ids.npy cache files
+
+    # ----------------------- cache helpers -----------------------
+
+    def _cache_paths(self, dim: int) -> tuple[str, str]:
+        """
+        Return (index_path, ids_path) for current index name.
+        File names encode N and dim to avoid mismatches.
+        """
+        assert self.cache_dir, "cache_dir not set"
+        os.makedirs(self.cache_dir, exist_ok=True)
+        n = len(self.image_ids)
+        base = f"{self.name}_N{n}_d{dim}"
+        return (
+            os.path.join(self.cache_dir, base + ".hnsw"),
+            os.path.join(self.cache_dir, base + "_ids.npy"),
+        )
+
+    def _try_load_hnsw(self, dim: int):
+        """Try to load cached HNSW + ids; returns True if successful."""
+        if not self.cache_dir:
+            return False
+        try:
+            import hnswlib  # noqa: F401
+        except Exception:
+            return False
+
+        idx_path, ids_path = self._cache_paths(dim)
+        if not (os.path.exists(idx_path) and os.path.exists(ids_path)):
+            return False
+
+        try:
+            ids_disk = np.load(ids_path, allow_pickle=True).tolist()
+        except Exception as e:
+            log.warning(f"[{self.name}] could not load ids cache: {e}")
+            return False
+
+        # basic sanity: same size + same set of ids
+        if len(ids_disk) != len(self.image_ids):
+            log.info(
+                f"[{self.name}] cache size mismatch (disk={len(ids_disk)} vs mem={len(self.image_ids)})"
+            )
+            return False
+        try:
+            if set(ids_disk) != set(self.image_ids):
+                log.info(f"[{self.name}] cache id set differs; rebuilding index")
+                return False
+        except Exception:
+            # if ids are not hashable for some reason, be conservative
+            return False
+
+        try:
+            import hnswlib
+            p = hnswlib.Index(space="cosine", dim=dim)
+            p.load_index(idx_path)
+            p.set_ef(self.ef_search_current)
+        except Exception as e:
+            log.warning(f"[{self.name}] could not load hnsw index: {e}")
+            return False
+
+        # adopt ids from disk to keep label->id mapping in sync
+        self.image_ids = ids_disk
+        self.ann = p
+        self._use_hnsw = True
+        self.X = None
+        log.info(
+            f"[{self.name}] loaded cached hnsw index (N={len(self.image_ids)}, d={dim})"
+        )
+        return True
+
+    def _save_hnsw(self, dim: int):
+        """Save current HNSW index and ids to cache_dir (best-effort)."""
+        if not (self.cache_dir and self._use_hnsw and self.ann is not None):
+            return
+        try:
+            idx_path, ids_path = self._cache_paths(dim)
+            self.ann.save_index(idx_path)
+            np.save(ids_path, np.array(self.image_ids, dtype=object))
+            log.info(f"[{self.name}] cached hnsw saved: {os.path.basename(idx_path)}")
+        except Exception as e:
+            # non-fatal: cache is only an acceleration
+            log.warning(f"[{self.name}] could not save hnsw cache: {e}")
+
+    # ------------------------- core API --------------------------
+
     def build(self, image_ids: list[str], X: np.ndarray, name: str):
-        """Build ANN or linear index for the provided vectors."""
+        """Build ANN or linear index for the provided vectors (with cache if available)."""
         t0 = time.time()
         self.name = name
         self.image_ids = list(image_ids)
         self.X = np.asarray(X, dtype=np.float32)
+
+        dim = int(self.X.shape[1])
         Xn = self.X / (np.linalg.norm(self.X, axis=1, keepdims=True) + 1e-8)
 
+        # If large enough for ANN, try load-from-cache first
         if len(image_ids) > self.use_ann_threshold:
+            # try cached index
+            if self._try_load_hnsw(dim):
+                return
+
+            # build fresh HNSW
             try:
                 import hnswlib
 
-                dim = int(self.X.shape[1])
                 self.ann = hnswlib.Index(space="cosine", dim=dim)
                 self.ann.init_index(
-                    max_elements=self.X.shape[0], ef_construction=self.ef_construction, M=self.M
+                    max_elements=Xn.shape[0],
+                    ef_construction=self.ef_construction,
+                    M=self.M,
                 )
                 self.ann.add_items(Xn, np.arange(Xn.shape[0]))
                 self.ann.set_ef(self.ef_search_default)
                 self.ef_search_current = self.ef_search_default
                 self._use_hnsw = True
+                self._norms = None
                 log.info(
-                    f"[{name}] hnswlib index built (N={self.X.shape[0]}, d={dim}, "
+                    f"[{name}] hnswlib index built (N={Xn.shape[0]}, d={dim}, "
                     f"M={self.M}, efC={self.ef_construction}, efS={self.ef_search_current}) "
                     f"in {time.time() - t0:.2f}s"
                 )
+                self._save_hnsw(dim)
+                return
             except Exception as e:
                 self._use_hnsw = False
                 log.warning(f"[{name}] hnswlib unavailable: {e} -> NumPy fallback")
 
-        if not self._use_hnsw:
-            # Precompute norms for fast cosine
-            self._norms = np.linalg.norm(self.X, axis=1).astype(np.float32) + 1e-8
-            log.info(
-                f"[{name}] NumPy-cosine index (N={self.X.shape[0]}) built in {time.time() - t0:.2f}s"
-            )
+        # Fallback: precompute norms for fast cosine
+        self._use_hnsw = False
+        self._norms = np.linalg.norm(self.X, axis=1).astype(np.float32) + 1e-8
+        log.info(
+            f"[{name}] NumPy-cosine index (N={self.X.shape[0]}) built in {time.time() - t0:.2f}s"
+        )
 
     def knn(self, q: np.ndarray, k: int) -> list[tuple[str, float]]:
         """Return top-k (image_id, cosine_sim) for query vector q."""
-        if self.X is None or len(self.image_ids) == 0:
+        if self.X is None and not (self._use_hnsw and self.ann is not None):
             return []
 
         q = np.asarray(q, dtype=np.float32).ravel()
@@ -256,12 +358,14 @@ class ImageRecommender:
         hnsw_M: int = 16,
         hnsw_ef_construction: int = 200,
         hnsw_ef_search: int = 200,
+        cache_dir: Optional[str] = None,
     ):
         """Wire DB, infer color params, init indices and embedder."""
         self.db = database
         inferred_bins, inferred_k = _infer_db_color_params(self.db.db_path)
         self.color_bins = color_bins or inferred_bins
         self.k_colors = k_colors or inferred_k
+        self.cache_dir = cache_dir
 
         self.sim = SimilarityCalculator()
         self.weights = weights or {"color": 0.4, "embedding": 0.4, "custom": 0.2}
@@ -272,12 +376,14 @@ class ImageRecommender:
             M=hnsw_M,
             ef_construction=hnsw_ef_construction,
             ef_search=hnsw_ef_search,
+            cache_dir=self.cache_dir, name="cheap"
         )
         self.idx_deep = ApproximateNearestNeighbor(
             use_ann_threshold=ann_threshold,
             M=hnsw_M,
             ef_construction=hnsw_ef_construction,
             ef_search=hnsw_ef_search,
+            cache_dir=self.cache_dir, name="deep"
         )
         self._build_indices()
 
@@ -333,18 +439,22 @@ class ImageRecommender:
         return rows
 
     def _build_indices(self):
-        """Build both indices from DB content (cheap + deep)."""
+        """Build both indices from DB content (cheap + deep). ANN kümmert sich um Cache."""
+        t_all = time.time()
         t0 = time.time()
-        ids_cheap, Xc, ids_deep, Xd = [], [], [], []
+        ids_cheap, Xc = [], []
+        ids_deep, Xd = [], []
         deep_count = 0
 
         for r in self._iter_rows():
+            # cheap vector (dominant colors + stats + texture moments)
             cheap = self._row_to_cheap(r)
             if cheap:
                 iid, v, _ = cheap
                 ids_cheap.append(iid)
                 Xc.append(v)
 
+            # deep embeddings (BLOB)
             blob, dim = r[5], r[6]
             if blob is not None and dim:
                 try:
@@ -355,14 +465,21 @@ class ImageRecommender:
                         deep_count += 1
                 except Exception:
                     pass
+        scan_s = time.time() - t0
 
+        t1 = time.time()
         if ids_cheap:
-            self.idx_cheap.build(ids_cheap, np.asarray(Xc, dtype=np.float32), name="cheap")
+            Xc = np.asarray(Xc, dtype=np.float32)
+            self.idx_cheap.build(ids_cheap, Xc, name="cheap")
+
         if ids_deep:
-            self.idx_deep.build(ids_deep, np.asarray(Xd, dtype=np.float32), name="deep")
+            Xd = np.asarray(Xd, dtype=np.float32)
+            self.idx_deep.build(ids_deep, Xd, name="deep")
+        build_s = time.time() - t1
 
         log.info(
-            f"Indices built in {time.time() - t0:.2f}s | cheap={len(ids_cheap)}, deep={deep_count}"
+            f"Indices scan={scan_s:.2f}s build/load={build_s:.2f}s total={time.time()-t_all:.2f}s | "
+            f"cheap={len(ids_cheap)}, deep={deep_count}"
         )
 
     def _query_features(self, img: np.ndarray):
