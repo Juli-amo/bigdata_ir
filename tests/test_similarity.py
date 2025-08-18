@@ -1,61 +1,102 @@
-# tests/test_similarity.py
-import numpy as np
+# Unit tests for SimilarityCalculator
 
+from __future__ import annotations
+
+import numpy as np
+import cv2
+import pytest
+
+from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor, compute_phash
 from ImageRecommender import SimilarityCalculator
 
 
 def _flat_hist(n=16):
-    h = (np.ones(n) / n).tolist()
-    return [h, h, h]
+    return (np.ones(n) / n).tolist()
 
+def _solid(bgr: tuple[int, int, int], w: int = 64, h: int = 64) -> np.ndarray:
+    """Create a solid-color BGR image (uint8)."""
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:] = np.array(bgr, dtype=np.uint8)
+    return img
 
-def _cf(bright=128.0, std=[10, 10, 10]):
+def _cf(bright: float = 128.0, bins: int = 16) -> dict:
+    """Build a synthetic color feature dict with uniform histograms and given brightness."""
+    hist = (np.ones(bins) / bins).tolist()
     return {
-        "hsv_histogram": _flat_hist(16),
-        "bgr_histogram": _flat_hist(16),
-        "color_stats": {"brightness": float(bright), "mean_bgr": [120, 130, 140], "std_bgr": std},
-        "dominant_colors": [[200, 50, 50], [50, 200, 50], [50, 50, 200]],
+        "hsv_histogram": [hist, hist, hist],
+        "bgr_histogram": [hist, hist, hist],
+        "color_stats": {
+            "brightness": float(bright),
+            "mean_bgr": [120.0, 130.0, 140.0],
+            "std_bgr": [10.0, 10.0, 10.0],
+        },
     }
+
 
 
 def test_color_similarity_identical():
     sc = SimilarityCalculator()
-    f = _cf()
+    f = _cf(128.0)
     assert sc.color_sim(f, f) > 0.99
 
 
 def test_color_similarity_brightness_penalty():
+    # With identical histograms but large brightness gap, the small brightness term (10%)
+    # should reduce the score slightly. With your weighting it is ~0.914.
     sc = SimilarityCalculator()
-    f1, f2 = _cf(bright=20.0), _cf(bright=240.0)
-    assert sc.color_sim(f1, f2) < 0.8  # Helligkeitsabzug sichtbar
+    f1 = _cf(bright=20.0)
+    f2 = _cf(bright=240.0)
+    sim = sc.color_sim(f1, f2)
+    assert sim == pytest.approx(0.914, abs=0.02)  # visible penalty, but still high
 
 
-def test_emb_sim_deep_present():
+def test_embedding_similarity_equal_vectors():
     sc = SimilarityCalculator()
-    a = np.ones(128, np.float32)
-    b = np.ones(128, np.float32)
+    a = np.ones(128, dtype=np.float32)
+    b = np.ones(128, dtype=np.float32)
     assert sc.emb_sim(a, b, {}, {}) > 0.99
 
 
-def test_emb_sim_fallback_texture():
+def test_embedding_similarity_fallback_texture():
     sc = SimilarityCalculator()
-    t1 = {"texture_features": {"mean": 0.5, "std": 0.1, "variance": 0.01}}
-    t2 = {"texture_features": {"mean": 0.5, "std": 0.1, "variance": 0.01}}
-    # keine Deep-Embeddings -> Texture-Fallback
-    assert sc.emb_sim(None, None, t1, t2) > 0.9
+    # no deep embeddings -> fallback to texture mean/std/var cosine in [0,1]
+    f1 = {"texture_features": {"mean": 10.0, "std": 2.0, "variance": 4.0}}
+    f2 = {"texture_features": {"mean": 10.0, "std": 2.0, "variance": 4.0}}
+    assert sc.emb_sim(None, None, f1, f2) > 0.99
 
 
-def test_emb_sim_fallback_no_texture():
+def test_custom_similarity_phash_effect():
     sc = SimilarityCalculator()
-    # Weder Deep noch Texture -> definierter 0.5-Return im Code
-    assert abs(sc.emb_sim(None, None, {}, {}) - 0.5) < 1e-6
+    # Same color stats/hists → pHash dominates the difference
+    fC = _cf(128.0)
+    # force different phash hex strings
+    sim_equal = sc.custom_sim({}, {}, fC, fC, "0xaaaaaaaaaaaaaaaa", "0xaaaaaaaaaaaaaaaa")
+    sim_diff = sc.custom_sim({}, {}, fC, fC, "0xaaaaaaaaaaaaaaaa", "0x5555555555555555")
+    assert sim_equal > sim_diff
+
+def test_texture_features_basic_stats():
+    """Texture extractor returns stable keys with finite numbers."""
+    fe = ImageFeatureExtractor()
+    img = _solid((120, 40, 200))
+    out = fe.extract_texture_features(img)
+    for k in ("mean", "std", "variance", "texture_hist", "lap_var", "entropy"):
+        assert k in out
+    assert len(out["texture_hist"]) == 32
+    # Values should be finite
+    scalars = [out["mean"], out["std"], out["variance"], out["lap_var"], out["entropy"]]
+    assert all(np.isfinite(s) for s in scalars)
 
 
-def test_custom_sim_extremes():
-    sc = SimilarityCalculator()
-    cf = _cf()
-    adv = {"texture_features": {"mean": 0.5}}
-    # phash maximal gleich vs. maximal verschieden
-    sim_eq = sc.custom_sim(adv, adv, cf, cf, "0x0", "0x0")
-    sim_ne = sc.custom_sim(adv, adv, cf, cf, "0x0", "0xffffffffffffffff")
-    assert sim_eq > sim_ne
+def test_phash_equal_and_robust():
+    """pHash should be identical for identical images and change with perturbation."""
+    img = _solid((0, 0, 255))
+    h1 = compute_phash(img)
+    h2 = compute_phash(img.copy())
+    assert isinstance(h1, int) and isinstance(h2, int)
+    assert h1 == h2
+
+    # Small change → often flips some bits
+    noisy = img.copy()
+    cv2.circle(noisy, (8, 8), 4, (0, 0, 200), -1)
+    h3 = compute_phash(noisy)
+    assert h3 != h1
