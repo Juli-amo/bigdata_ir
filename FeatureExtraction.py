@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional
-import numpy as np
-import cv2
+from typing import Any
 
+import cv2
+import numpy as np
 
 __all__ = [
     "ColorAnalyzer",
@@ -51,9 +51,13 @@ class ColorAnalyzer:
         nh, nw = int(round(h * scale)), int(round(w * scale))
         return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    def _calc_norm_hist(self, image: np.ndarray, channel: int, num_bins: int, range_max: int) -> np.ndarray:
+    def _calc_norm_hist(
+        self, image: np.ndarray, channel: int, num_bins: int, range_max: int
+    ) -> np.ndarray:
         """Normalized 1D histogram for a single channel."""
-        hist = cv2.calcHist([image], [channel], None, [int(num_bins)], [0, int(range_max)]).astype(np.float32)
+        hist = cv2.calcHist([image], [channel], None, [int(num_bins)], [0, int(range_max)]).astype(
+            np.float32
+        )
         return (hist / (float(hist.sum()) + 1e-8)).flatten()
 
     # ------------------------ public API -------------------------
@@ -94,14 +98,16 @@ class ColorAnalyzer:
         if show_plots:
             import matplotlib.pyplot as plt  # lazy import
 
-        sims: List[float] = []
+        sims: list[float] = []
         for i, ch in enumerate(channels):
             h1 = self._calc_norm_hist(img1, i, num_bins, ranges[i])
             h2 = self._calc_norm_hist(img2, i, num_bins, ranges[i])
 
             if use_opencv:
                 # cv2.HISTCMP_CORREL returns [-1,1] → map to [0,1]
-                raw = float(cv2.compareHist(h1.astype("float32"), h2.astype("float32"), cv2.HISTCMP_CORREL))
+                raw = float(
+                    cv2.compareHist(h1.astype("float32"), h2.astype("float32"), cv2.HISTCMP_CORREL)
+                )
                 sim = max(0.0, min(1.0, (raw + 1.0) * 0.5))
             else:
                 num = float(np.dot(h1, h2))
@@ -143,7 +149,9 @@ class ColorAnalyzer:
             lab_sample, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
         )
         centers_lab_u8 = np.clip(centers_lab, 0, 255).astype("uint8").reshape(-1, 1, 3)
-        centers_bgr = cv2.cvtColor(centers_lab_u8, cv2.COLOR_LAB2BGR).reshape(K, 3).astype("float32")
+        centers_bgr = (
+            cv2.cvtColor(centers_lab_u8, cv2.COLOR_LAB2BGR).reshape(K, 3).astype("float32")
+        )
 
         # Sort by brightness to get a stable ordering
         order = np.argsort(centers_bgr.sum(axis=1))
@@ -153,7 +161,9 @@ class ColorAnalyzer:
         """Euclidean distance between two color center sets."""
         return float(np.linalg.norm(colors1 - colors2))
 
-    def extract_color_features(self, image: np.ndarray, num_bins: int = 32, num_dominant: int = 3) -> Dict[str, Any]:
+    def extract_color_features(
+        self, image: np.ndarray, num_bins: int = 32, num_dominant: int = 3
+    ) -> dict[str, Any]:
         """Aggregate color features (histograms, stats, dominant colors)."""
         bgr = self._shrink(self._ensure_bgr3(image))
 
@@ -161,8 +171,10 @@ class ColorAnalyzer:
         b = cv2.calcHist([bgr], [0], None, [num_bins], [0, 256]).astype("float32")
         g = cv2.calcHist([bgr], [1], None, [num_bins], [0, 256]).astype("float32")
         r = cv2.calcHist([bgr], [2], None, [num_bins], [0, 256]).astype("float32")
-        def _norm(h: np.ndarray) -> List[float]:
+
+        def _norm(h: np.ndarray) -> list[float]:
             return (h / (float(h.sum()) + 1e-8)).flatten().tolist()
+
         bgr_hist = [_norm(b), _norm(g), _norm(r)]
 
         # HSV histograms
@@ -181,7 +193,9 @@ class ColorAnalyzer:
         # Dominant colors (k-means in Lab)
         centers = self.get_dominant_colors(bgr)
         if centers.shape[0] < num_dominant:
-            pad = np.tile(centers.mean(axis=0, keepdims=True), (num_dominant - centers.shape[0], 1))
+            pad = np.tile(
+                centers.mean(axis=0, keepdims=True), (num_dominant - centers.shape[0], 1)
+            )
             centers = np.vstack([centers, pad])
         centers = centers[: int(num_dominant)]
 
@@ -196,7 +210,7 @@ class ColorAnalyzer:
 class ImageFeatureExtractor:
     """Simple texture features based on gradients, Laplacian and entropy."""
 
-    def extract_texture_features(self, image: np.ndarray, num_bins: int = 32) -> Dict[str, Any]:
+    def extract_texture_features(self, image: np.ndarray, num_bins: int = 32) -> dict[str, Any]:
         """Return basic texture statistics and gradient histogram."""
         if image is None:
             raise ValueError("image is None")

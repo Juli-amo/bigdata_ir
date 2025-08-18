@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, List
+from typing import Optional
 
 import numpy as np
 
@@ -12,6 +12,7 @@ try:
     import torch.nn as nn
     import torchvision.models as models
     import torchvision.transforms as T
+
     _TORCH_OK = True
 except Exception as e:  # pragma: no cover
     _TORCH_OK = False
@@ -60,10 +61,14 @@ class VisionEmbedder:
         self.backbone.to(self.device).eval()
 
         # 128D projection head
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim, proj_dim, bias=False),
-            nn.LayerNorm(proj_dim),
-        ).to(self.device).eval()
+        self.head = (
+            nn.Sequential(
+                nn.Linear(feat_dim, proj_dim, bias=False),
+                nn.LayerNorm(proj_dim),
+            )
+            .to(self.device)
+            .eval()
+        )
 
         # Preprocessing (HWC uint8 -> CHW float, resize/crop/normalize)
         self.tf = T.Compose(
@@ -170,11 +175,11 @@ class VisionEmbedder:
         return self.embed_array(img)
 
     @torch.inference_mode()
-    def embed_batch(self, imgs_bgr: List[np.ndarray], batch_size: int = 64) -> np.ndarray:
+    def embed_batch(self, imgs_bgr: list[np.ndarray], batch_size: int = 64) -> np.ndarray:
         """Embed a list of BGR images in mini-batches -> [N,128]."""
         if not imgs_bgr:
             return np.empty((0, 128), dtype=np.float32)
-        outs: List[np.ndarray] = []
+        outs: list[np.ndarray] = []
         for i in range(0, len(imgs_bgr), max(1, int(batch_size))):
             batch = imgs_bgr[i : i + batch_size]
             xs = [self._preprocess(im) for im in batch]
@@ -190,6 +195,7 @@ class VisionEmbedder:
         try:
             if self.device.type == "cuda":
                 import torch.cuda as _tc  # lazy import
+
                 _tc.empty_cache()
         except Exception:
             pass

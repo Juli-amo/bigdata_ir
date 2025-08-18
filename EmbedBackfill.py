@@ -21,16 +21,16 @@ Usage (polling):
 
 from __future__ import annotations
 
-import os
-import time
 import json
 import logging
+import os
 import sqlite3
-from typing import List, Tuple, Optional, Dict
-
-import numpy as np
-import cv2
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+import cv2
+import numpy as np
 
 from DeepEmbedding import VisionEmbedder  # uses MPS if available
 
@@ -49,7 +49,7 @@ JPEG_EXTS = {".jpg", ".jpeg"}
 
 HAVE_TURBO = False
 try:
-    from turbojpeg import TurboJPEG, TJPF_BGR, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT  # type: ignore
+    from turbojpeg import TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_BGR, TurboJPEG  # type: ignore
 
     HAVE_TURBO = True
 except Exception:
@@ -58,7 +58,7 @@ except Exception:
 _TLS_TURBO: Optional[TurboJPEG] = None
 
 
-def _get_turbo() -> Optional["TurboJPEG"]:
+def _get_turbo() -> Optional[TurboJPEG]:
     """Lazy-initialize TurboJPEG (if installed)."""
     global _TLS_TURBO
     if not HAVE_TURBO:
@@ -72,6 +72,7 @@ def _get_turbo() -> Optional["TurboJPEG"]:
 # --------------------------------------------------------------------------- #
 # SQLite helpers
 # --------------------------------------------------------------------------- #
+
 
 def _ensure_pragmas(conn: sqlite3.Connection) -> None:
     """Speed-friendly PRAGMAs for WAL SQLite workloads."""
@@ -95,7 +96,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _fetch_missing(conn: sqlite3.Connection, limit: Optional[int] = None) -> List[Tuple[str, str]]:
+def _fetch_missing(conn: sqlite3.Connection, limit: Optional[int] = None) -> list[tuple[str, str]]:
     """Return (image_id, filepath) for rows without deep_embeddings."""
     c = conn.cursor()
     q = """
@@ -110,7 +111,7 @@ def _fetch_missing(conn: sqlite3.Connection, limit: Optional[int] = None) -> Lis
     return [(r[0], r[1]) for r in c.fetchall()]
 
 
-def _save_batch(conn: sqlite3.Connection, rows: List[Tuple[str, bytes, int]]) -> None:
+def _save_batch(conn: sqlite3.Connection, rows: list[tuple[str, bytes, int]]) -> None:
     """Upsert (image_id, deep_embeddings, deep_dim) into advanced_features."""
     c = conn.cursor()
     c.executemany(
@@ -127,7 +128,7 @@ def _save_batch(conn: sqlite3.Connection, rows: List[Tuple[str, bytes, int]]) ->
 
 def _save_batch_robust(
     conn: sqlite3.Connection,
-    rows: List[Tuple[str, bytes, int]],
+    rows: list[tuple[str, bytes, int]],
     retries: int = 40,
     sleep_s: float = 0.25,
 ) -> bool:
@@ -148,6 +149,7 @@ def _save_batch_robust(
 # Decoders
 # --------------------------------------------------------------------------- #
 
+
 def _read_bytes(path: str) -> Optional[bytes]:
     """Read file into bytes (no buffering for speed)."""
     try:
@@ -167,8 +169,12 @@ def _decode_turbo(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
         return None
     sf = {1: (1, 1), 2: (1, 2), 4: (1, 4), 8: (1, 8)}.get(int(jpeg_reduce), (1, 8))
     try:
-        return tj.decode(data, pixel_format=TJPF_BGR, scaling_factor=sf,
-                         flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
+        return tj.decode(
+            data,
+            pixel_format=TJPF_BGR,
+            scaling_factor=sf,
+            flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT,
+        )
     except Exception:
         return None
 
@@ -181,10 +187,16 @@ def _decode_imdecode(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
     try:
         arr = np.frombuffer(data, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is not None and os.path.splitext(path)[1].lower() in JPEG_EXTS and jpeg_reduce in (2, 4, 8):
+        if (
+            img is not None
+            and os.path.splitext(path)[1].lower() in JPEG_EXTS
+            and jpeg_reduce in (2, 4, 8)
+        ):
             f = 1.0 / float(jpeg_reduce)
             h, w = img.shape[:2]
-            img = cv2.resize(img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA)
+            img = cv2.resize(
+                img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA
+            )
         return img
     except Exception:
         return None
@@ -230,6 +242,7 @@ def _decode_one(path: str, decode_mode: str, jpeg_reduce: int) -> Optional[np.nd
 # Backfill core
 # --------------------------------------------------------------------------- #
 
+
 def backfill_once(
     db_path: str,
     batch: int = 192,
@@ -238,13 +251,12 @@ def backfill_once(
     jpeg_reduce: int = 8,
     log_every: int = 5,
     fetch_limit: int = 5000,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Process up to `fetch_limit` missing items exactly once.
 
     Returns:
         dict with 'processed', 'saved', 'elapsed_s', 'throughput_imgs_per_s'.
     """
-    t_round = time.time()
     conn = sqlite3.connect(db_path)
     _ensure_pragmas(conn)
     _ensure_columns(conn)
@@ -258,7 +270,9 @@ def backfill_once(
         return {"processed": 0, "saved": 0, "elapsed_s": 0.0, "throughput_imgs_per_s": 0.0}
 
     N = len(todo)
-    log.info(f"{N} pending embeddings – starting (device={emb.device}, batch={batch}, io_workers={io_workers})")
+    log.info(
+        f"{N} pending embeddings – starting (device={emb.device}, batch={batch}, io_workers={io_workers})"
+    )
 
     saved = 0
     processed = 0
@@ -271,9 +285,12 @@ def backfill_once(
         chunk = todo[ci : ci + chunk_size]
 
         # Parallel decoding
-        imgs: List[Optional[np.ndarray]] = [None] * len(chunk)
+        imgs: list[Optional[np.ndarray]] = [None] * len(chunk)
         with ThreadPoolExecutor(max_workers=io_workers) as ex:
-            futures = {ex.submit(_decode_one, p, decode_mode, jpeg_reduce): j for j, (_, p) in enumerate(chunk)}
+            futures = {
+                ex.submit(_decode_one, p, decode_mode, jpeg_reduce): j
+                for j, (_, p) in enumerate(chunk)
+            }
             for fut in as_completed(futures):
                 j = futures[fut]
                 try:
@@ -301,7 +318,7 @@ def backfill_once(
                     Z = None
 
                 if Z is not None and len(Z) > 0:
-                    rows: List[Tuple[str, bytes, int]] = []
+                    rows: list[tuple[str, bytes, int]] = []
                     for off, zi in zip(idx_local, Z):
                         iid = sub[off][0]
                         rows.append((iid, memoryview(zi.tobytes()), int(zi.shape[0])))
@@ -321,13 +338,13 @@ def backfill_once(
                 eta_h, eta_m = divmod(eta_m, 60)
                 log.info(
                     f"... {saved}/{N} embeddings | {rate:.1f} imgs/s | "
-                    f"elapsed {elapsed/60:.1f} min | ETA {eta_h:02d}:{eta_m:02d}:{eta_s_rem:02d}"
+                    f"elapsed {elapsed / 60:.1f} min | ETA {eta_h:02d}:{eta_m:02d}:{eta_s_rem:02d}"
                 )
                 last_log = now
 
     elapsed = time.time() - start
     rate = saved / max(1e-6, elapsed)
-    log.info(f"round done: {saved}/{N} embedded in {elapsed/60:.1f} min ({rate:.1f} imgs/s)")
+    log.info(f"round done: {saved}/{N} embedded in {elapsed / 60:.1f} min ({rate:.1f} imgs/s)")
 
     # small optimize/housekeeping
     try:
@@ -390,6 +407,7 @@ def backfill_polling(
 # CLI
 # --------------------------------------------------------------------------- #
 
+
 def _build_cli():
     import argparse
 
@@ -404,12 +422,22 @@ def _build_cli():
         default="auto",
         help="Decoder selection",
     )
-    ap.add_argument("--jpeg-reduce", type=int, choices=[1, 2, 4, 8], default=8, help="JPEG reduced decode factor")
+    ap.add_argument(
+        "--jpeg-reduce",
+        type=int,
+        choices=[1, 2, 4, 8],
+        default=8,
+        help="JPEG reduced decode factor",
+    )
     ap.add_argument("--log-every", type=int, default=5, help="Seconds between progress logs")
-    ap.add_argument("--poll-interval", type=int, default=300, help="Seconds to wait when nothing to do")
+    ap.add_argument(
+        "--poll-interval", type=int, default=300, help="Seconds to wait when nothing to do"
+    )
     ap.add_argument("--fetch-limit", type=int, default=5000, help="Max rows per round")
     ap.add_argument("--once", action="store_true", help="Run only a single round")
-    ap.add_argument("--round-limit", type=int, default=None, help="Stop after N rounds (polling mode)")
+    ap.add_argument(
+        "--round-limit", type=int, default=None, help="Stop after N rounds (polling mode)"
+    )
     return ap
 
 
@@ -428,7 +456,12 @@ def main():
             fetch_limit=args.fetch_limit,
         )
         # print compact JSON summary to stdout
-        print(json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in stats.items()}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {k: round(v, 3) if isinstance(v, float) else v for k, v in stats.items()},
+                ensure_ascii=False,
+            )
+        )
     else:
         backfill_polling(
             db_path=args.db,

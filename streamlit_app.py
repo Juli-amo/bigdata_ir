@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Optional
 
 import numpy as np
 import streamlit as st
@@ -22,7 +22,6 @@ except Exception as e:
 from ImageDatabase import ImageDatabase
 from ImageRecommender import ImageRecommender
 
-
 # ----------------------------- Page setup ------------------------------------
 st.set_page_config(page_title="Image Recommender", layout="wide")
 st.title("🔎 Image Recommender — Demo UI")
@@ -37,7 +36,7 @@ def load_recommender(db_path: str) -> ImageRecommender:
     return rec
 
 
-def normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
+def normalize_weights(w: dict[str, float]) -> dict[str, float]:
     """Normalize non-negative weights to sum to 1. Fallback to deep if all zero."""
     s = sum(max(0.0, v) for v in w.values())
     if s <= 0:
@@ -45,7 +44,7 @@ def normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
     return {k: float(max(0.0, v)) / s for k, v in w.items()}
 
 
-def set_rec_weights(rec: ImageRecommender, w: Dict[str, float]) -> None:
+def set_rec_weights(rec: ImageRecommender, w: dict[str, float]) -> None:
     """Apply normalized weights on the recommender."""
     rec.weights = normalize_weights(w)
 
@@ -109,7 +108,8 @@ def _graceful_exit(delay_s: float = 0.4) -> None:
         st.warning(f"Cleanup issue: {e}")
     time.sleep(delay_s)
     try:
-        import os, signal
+        import os
+        import signal
 
         os.kill(os.getpid(), signal.SIGTERM)
     except Exception:
@@ -208,7 +208,9 @@ uploaded = st.file_uploader(
     type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
 )
 
-go = st.button("🚀 Run search", type="primary", use_container_width=True, disabled=(uploaded is None))
+go = st.button(
+    "🚀 Run search", type="primary", use_container_width=True, disabled=(uploaded is None)
+)
 
 if go:
     q_bgr = bgr_from_upload(uploaded)
@@ -221,7 +223,7 @@ if go:
     # Execute query (measure time)
     t0 = time.time()
     try:
-        results: List[Dict] = rec.find_similar_images(q_bgr, top_k=topk, candidates=candidates)
+        results: list[dict] = rec.find_similar_images(q_bgr, top_k=topk, candidates=candidates)
     except Exception as e:
         st.error(f"Search failed: {e}")
         st.stop()
@@ -241,7 +243,7 @@ if go:
         meta = r.get("metadata") or {}
         fp = meta.get("filepath", "")
         rgb = load_rgb_from_path(fp)
-        cap = f"{meta.get('filename','?')} • Score: {r.get('similarity_score',0):.2f}"
+        cap = f"{meta.get('filename', '?')} • Score: {r.get('similarity_score', 0):.2f}"
         with cols[i]:
             if rgb is not None:
                 st.image(rgb, caption=cap, use_container_width=True)

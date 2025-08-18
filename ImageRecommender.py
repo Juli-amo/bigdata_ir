@@ -1,15 +1,15 @@
-import time
 import json
 import logging
 import sqlite3
-from typing import List, Dict, Tuple, Optional, Union
+import time
+from typing import Optional, Union
 
 import cv2
 import numpy as np
 
+from DeepEmbedding import VisionEmbedder
 from FeatureExtraction import ColorAnalyzer, ImageFeatureExtractor, compute_phash
 from ImageDatabase import ImageDatabase
-from DeepEmbedding import VisionEmbedder
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ImageRecommender")
@@ -25,8 +25,8 @@ def _infer_db_color_params(db_path: str) -> tuple[int, int]:
         con.close()
         if not row:
             return 32, 3
-        dom = json.loads(row[0])       # list of Kx3
-        hsv = json.loads(row[1])       # [[H],[S],[V]] len=num_bins
+        dom = json.loads(row[0])  # list of Kx3
+        hsv = json.loads(row[1])  # [[H],[S],[V]] len=num_bins
         bins = len(hsv[0]) if isinstance(hsv, list) and hsv and isinstance(hsv[0], list) else 32
         k = len(dom) if isinstance(dom, list) else 3
         return int(bins), int(k)
@@ -56,6 +56,7 @@ class SimilarityCalculator:
     def _phash_sim(self, hex1: Optional[str], hex2: Optional[str], bits: int = 64) -> float:
         """Map Hamming distance of 64-bit pHash to [0,1] similarity."""
         try:
+
             def _to_int(x):
                 if x is None:
                     return None
@@ -80,19 +81,19 @@ class SimilarityCalculator:
         except Exception:
             return 0.0
 
-    def color_sim(self, f1: Dict, f2: Dict) -> float:
+    def color_sim(self, f1: dict, f2: dict) -> float:
         """Weighted cosine on HSV/BGR histograms + brightness proximity."""
         try:
-            hsv1 = np.array(f1['hsv_histogram']).flatten()
-            hsv2 = np.array(f2['hsv_histogram']).flatten()
-            bgr1 = np.array(f1['bgr_histogram']).flatten()
-            bgr2 = np.array(f2['bgr_histogram']).flatten()
+            hsv1 = np.array(f1["hsv_histogram"]).flatten()
+            hsv2 = np.array(f2["hsv_histogram"]).flatten()
+            bgr1 = np.array(f1["bgr_histogram"]).flatten()
+            bgr2 = np.array(f2["bgr_histogram"]).flatten()
 
             hsv_sim = self._cos(hsv1, hsv2)
             bgr_sim = self._cos(bgr1, bgr2)
 
-            bright1 = float(f1['color_stats']['brightness'])
-            bright2 = float(f2['color_stats']['brightness'])
+            bright1 = float(f1["color_stats"]["brightness"])
+            bright2 = float(f2["color_stats"]["brightness"])
             bright_sim = max(0.0, 1.0 - abs(bright1 - bright2) / 255.0)
 
             s = 0.45 * hsv_sim + 0.45 * bgr_sim + 0.10 * bright_sim
@@ -102,33 +103,26 @@ class SimilarityCalculator:
             return 0.0
 
     def emb_sim(
-        self,
-        e1: Optional[np.ndarray],
-        e2: Optional[np.ndarray],
-        fallback1: Dict,
-        fallback2: Dict
+        self, e1: Optional[np.ndarray], e2: Optional[np.ndarray], fallback1: dict, fallback2: dict
     ) -> float:
         """Cosine on deep embeddings; falls back to simple texture stats."""
         if e1 is not None and e2 is not None:
             return float((self._cos(e1, e2) + 1.0) * 0.5)  # [-1,1] → [0,1]
-        t1 = (fallback1 or {}).get('texture_features') or {}
-        t2 = (fallback2 or {}).get('texture_features') or {}
+        t1 = (fallback1 or {}).get("texture_features") or {}
+        t2 = (fallback2 or {}).get("texture_features") or {}
         if not t1 or not t2:
             return 0.5
-        v1 = [t1.get('mean', 0), t1.get('std', 0), t1.get('variance', 0)]
-        v2 = [t2.get('mean', 0), t2.get('std', 0), t2.get('variance', 0)]
+        v1 = [t1.get("mean", 0), t1.get("std", 0), t1.get("variance", 0)]
+        v2 = [t2.get("mean", 0), t2.get("std", 0), t2.get("variance", 0)]
         return float((self._cos(v1, v2) + 1.0) * 0.5)
 
     def custom_sim(
-        self,
-        adv1: Dict, adv2: Dict,
-        cf1: Dict, cf2: Dict,
-        ph1: Optional[str], ph2: Optional[str]
+        self, adv1: dict, adv2: dict, cf1: dict, cf2: dict, ph1: Optional[str], ph2: Optional[str]
     ) -> float:
         """Blend of pHash similarity, variance similarity, and entropy proximity."""
         try:
-            v1 = np.array(cf1['color_stats']['std_bgr'], dtype=np.float32)
-            v2 = np.array(cf2['color_stats']['std_bgr'], dtype=np.float32)
+            v1 = np.array(cf1["color_stats"]["std_bgr"], dtype=np.float32)
+            v2 = np.array(cf2["color_stats"]["std_bgr"], dtype=np.float32)
             var_sim = 1.0 - np.linalg.norm(v1 - v2) / (255.0 * np.sqrt(3.0))
             var_sim = float(min(1.0, max(0.0, var_sim)))
 
@@ -137,8 +131,8 @@ class SimilarityCalculator:
                 h = h / (h.sum() + 1e-8)
                 return float(-np.sum(np.where(h > 0, h * np.log(h + 1e-8), 0.0)))
 
-            e1 = _ent(cf1['bgr_histogram'])
-            e2 = _ent(cf2['bgr_histogram'])
+            e1 = _ent(cf1["bgr_histogram"])
+            e2 = _ent(cf2["bgr_histogram"])
             ent_sim = 1.0 - abs(e1 - e2) / max(e1, e2, 1.0)
             ent_sim = float(min(1.0, max(0.0, ent_sim)))
 
@@ -161,7 +155,7 @@ class ApproximateNearestNeighbor:
         use_ann_threshold: int = 5000,
         M: int = 16,
         ef_construction: int = 200,
-        ef_search: int = 200
+        ef_search: int = 200,
     ):
         """Store HNSW parameters and allocate holders for data/index."""
         self.use_ann_threshold = int(use_ann_threshold)
@@ -170,14 +164,14 @@ class ApproximateNearestNeighbor:
         self.ef_search_default = int(ef_search)
         self.ef_search_current = int(ef_search)
 
-        self.image_ids: List[str] = []
+        self.image_ids: list[str] = []
         self.X: Optional[np.ndarray] = None
         self._use_hnsw = False
         self._norms: Optional[np.ndarray] = None
         self.name = "cheap"
         self.ann = None  # hnswlib.Index, if available
 
-    def build(self, image_ids: List[str], X: np.ndarray, name: str):
+    def build(self, image_ids: list[str], X: np.ndarray, name: str):
         """Build ANN or linear index for the provided vectors."""
         t0 = time.time()
         self.name = name
@@ -188,20 +182,21 @@ class ApproximateNearestNeighbor:
         if len(image_ids) > self.use_ann_threshold:
             try:
                 import hnswlib
+
                 dim = int(self.X.shape[1])
-                self.ann = hnswlib.Index(space='cosine', dim=dim)
+                self.ann = hnswlib.Index(space="cosine", dim=dim)
                 self.ann.init_index(
-                    max_elements=self.X.shape[0],
-                    ef_construction=self.ef_construction,
-                    M=self.M
+                    max_elements=self.X.shape[0], ef_construction=self.ef_construction, M=self.M
                 )
                 self.ann.add_items(Xn, np.arange(Xn.shape[0]))
                 self.ann.set_ef(self.ef_search_default)
                 self.ef_search_current = self.ef_search_default
                 self._use_hnsw = True
-                log.info(f"[{name}] hnswlib index built (N={self.X.shape[0]}, d={dim}, "
-                         f"M={self.M}, efC={self.ef_construction}, efS={self.ef_search_current}) "
-                         f"in {time.time()-t0:.2f}s")
+                log.info(
+                    f"[{name}] hnswlib index built (N={self.X.shape[0]}, d={dim}, "
+                    f"M={self.M}, efC={self.ef_construction}, efS={self.ef_search_current}) "
+                    f"in {time.time() - t0:.2f}s"
+                )
             except Exception as e:
                 self._use_hnsw = False
                 log.warning(f"[{name}] hnswlib unavailable: {e} -> NumPy fallback")
@@ -209,9 +204,11 @@ class ApproximateNearestNeighbor:
         if not self._use_hnsw:
             # Precompute norms for fast cosine
             self._norms = np.linalg.norm(self.X, axis=1).astype(np.float32) + 1e-8
-            log.info(f"[{name}] NumPy-cosine index (N={self.X.shape[0]}) built in {time.time()-t0:.2f}s")
+            log.info(
+                f"[{name}] NumPy-cosine index (N={self.X.shape[0]}) built in {time.time() - t0:.2f}s"
+            )
 
-    def knn(self, q: np.ndarray, k: int) -> List[Tuple[str, float]]:
+    def knn(self, q: np.ndarray, k: int) -> list[tuple[str, float]]:
         """Return top-k (image_id, cosine_sim) for query vector q."""
         if self.X is None or len(self.image_ids) == 0:
             return []
@@ -252,13 +249,13 @@ class ImageRecommender:
     def __init__(
         self,
         database: ImageDatabase,
-        weights: Optional[Dict[str, float]] = None,
+        weights: Optional[dict[str, float]] = None,
         color_bins: Optional[int] = None,
         k_colors: Optional[int] = None,
         ann_threshold: int = 1000,
         hnsw_M: int = 16,
         hnsw_ef_construction: int = 200,
-        hnsw_ef_search: int = 200
+        hnsw_ef_search: int = 200,
     ):
         """Wire DB, infer color params, init indices and embedder."""
         self.db = database
@@ -267,32 +264,40 @@ class ImageRecommender:
         self.k_colors = k_colors or inferred_k
 
         self.sim = SimilarityCalculator()
-        self.weights = weights or {'color': 0.4, 'embedding': 0.4, 'custom': 0.2}
+        self.weights = weights or {"color": 0.4, "embedding": 0.4, "custom": 0.2}
         self.embedder = VisionEmbedder(model_name="mobilenet_v3_large", proj_dim=128, seed=42)
 
         self.idx_cheap = ApproximateNearestNeighbor(
             use_ann_threshold=ann_threshold,
-            M=hnsw_M, ef_construction=hnsw_ef_construction, ef_search=hnsw_ef_search
+            M=hnsw_M,
+            ef_construction=hnsw_ef_construction,
+            ef_search=hnsw_ef_search,
         )
         self.idx_deep = ApproximateNearestNeighbor(
             use_ann_threshold=ann_threshold,
-            M=hnsw_M, ef_construction=hnsw_ef_construction, ef_search=hnsw_ef_search
+            M=hnsw_M,
+            ef_construction=hnsw_ef_construction,
+            ef_search=hnsw_ef_search,
         )
         self._build_indices()
 
-    def _row_to_cheap(self, row) -> Optional[Tuple[str, np.ndarray, Optional[str]]]:
+    def _row_to_cheap(self, row) -> Optional[tuple[str, np.ndarray, Optional[str]]]:
         """Row -> (image_id, cheap_vector, phash_hex)."""
         try:
             iid = row[0]
             dom = np.array(json.loads(row[1]), dtype=np.float32).flatten()
             stats = json.loads(row[2])
-            vstats = [stats['brightness'], *stats['mean_bgr'], *stats['std_bgr']]
+            vstats = [stats["brightness"], *stats["mean_bgr"], *stats["std_bgr"]]
             vec = list(dom) + vstats
             # texture placeholders (3 simple moments)
             if row[3]:
                 try:
                     t = json.loads(row[3])
-                    vec += [float(t.get('mean', 0)), float(t.get('std', 0)), float(t.get('variance', 0))]
+                    vec += [
+                        float(t.get("mean", 0)),
+                        float(t.get("std", 0)),
+                        float(t.get("variance", 0)),
+                    ]
                 except Exception:
                     vec += [0.0, 0.0, 0.0]
             else:
@@ -302,7 +307,7 @@ class ImageRecommender:
                 try:
                     cf = json.loads(row[4])
                     if isinstance(cf, dict):
-                        ph = cf.get('phash_hex')
+                        ph = cf.get("phash_hex")
                 except Exception:
                     pass
             return iid, np.asarray(vec, dtype=np.float32), ph
@@ -357,7 +362,7 @@ class ImageRecommender:
             self.idx_deep.build(ids_deep, np.asarray(Xd, dtype=np.float32), name="deep")
 
         log.info(
-            f"Indices built in {time.time()-t0:.2f}s | cheap={len(ids_cheap)}, deep={deep_count}"
+            f"Indices built in {time.time() - t0:.2f}s | cheap={len(ids_cheap)}, deep={deep_count}"
         )
 
     def _query_features(self, img: np.ndarray):
@@ -375,7 +380,9 @@ class ImageRecommender:
             s = max(h, w)
             if s > max_side:
                 scale = max_side / float(s)
-                return cv2.resize(im, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                return cv2.resize(
+                    im, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+                )
             return im
 
         try:
@@ -384,19 +391,19 @@ class ImageRecommender:
         except Exception:
             ph_hex = None
 
-        dom = np.array(cf['dominant_colors'], dtype=np.float32).flatten()
-        stats = cf['color_stats']
-        vstats = [stats['brightness'], *stats['mean_bgr'], *stats['std_bgr']]
+        dom = np.array(cf["dominant_colors"], dtype=np.float32).flatten()
+        stats = cf["color_stats"]
+        vstats = [stats["brightness"], *stats["mean_bgr"], *stats["std_bgr"]]
         cheap_vec = np.asarray(
-            list(dom) + vstats + [tf.get('mean', 0), tf.get('std', 0), tf.get('variance', 0)],
-            dtype=np.float32
+            list(dom) + vstats + [tf.get("mean", 0), tf.get("std", 0), tf.get("variance", 0)],
+            dtype=np.float32,
         )
 
         # deep embedding if available
         z = self.embedder.embed_array(img) if self.embedder.available() else None
-        return cheap_vec, z, cf, {'texture_features': tf}, ph_hex
+        return cheap_vec, z, cf, {"texture_features": tf}, ph_hex
 
-    def _bulk_fetch_candidates(self, cand_ids: List[str]):
+    def _bulk_fetch_candidates(self, cand_ids: list[str]):
         """Fetch color/adv/embedding blobs for a candidate id list."""
         if not cand_ids:
             return []
@@ -422,34 +429,36 @@ class ImageRecommender:
 
     def _rerank(
         self,
-        q_cf: Dict, q_adv: Dict,
-        q_deep: Optional[np.ndarray], q_ph: Optional[str],
-        rows: List[tuple],
-        top_k: int
-    ) -> List[Dict]:
+        q_cf: dict,
+        q_adv: dict,
+        q_deep: Optional[np.ndarray],
+        q_ph: Optional[str],
+        rows: list[tuple],
+        top_k: int,
+    ) -> list[dict]:
         """Compute final scores and return top-k result dicts."""
         results = []
         for r in rows:
             iid = r[0]
             db_cf = {
-                'dominant_colors': json.loads(r[1]),
-                'hsv_histogram': json.loads(r[2]),
-                'bgr_histogram': json.loads(r[3]),
-                'color_stats': json.loads(r[4]),
+                "dominant_colors": json.loads(r[1]),
+                "hsv_histogram": json.loads(r[2]),
+                "bgr_histogram": json.loads(r[3]),
+                "color_stats": json.loads(r[4]),
             }
 
             db_adv = {}
             db_ph = None
             if r[5]:
                 try:
-                    db_adv = {'texture_features': json.loads(r[5])}
+                    db_adv = {"texture_features": json.loads(r[5])}
                 except Exception:
                     db_adv = {}
             if r[6]:
                 try:
                     cfj = json.loads(r[6])
                     if isinstance(cfj, dict):
-                        db_ph = cfj.get('phash_hex')
+                        db_ph = cfj.get("phash_hex")
                 except Exception:
                     db_ph = None
 
@@ -467,13 +476,20 @@ class ImageRecommender:
             u_sim = self.sim.custom_sim(q_adv, db_adv, q_cf, db_cf, q_ph, db_ph)
 
             score = (
-                self.weights['color'] * c_sim +
-                self.weights['embedding'] * e_sim +
-                self.weights['custom'] * u_sim
+                self.weights["color"] * c_sim
+                + self.weights["embedding"] * e_sim
+                + self.weights["custom"] * u_sim
             )
             results.append(
-                (iid, float(score),
-                 {'color_similarity': c_sim, 'embedding_similarity': e_sim, 'custom_similarity': u_sim})
+                (
+                    iid,
+                    float(score),
+                    {
+                        "color_similarity": c_sim,
+                        "embedding_similarity": e_sim,
+                        "custom_similarity": u_sim,
+                    },
+                )
             )
 
         results.sort(key=lambda x: x[1], reverse=True)
@@ -482,15 +498,14 @@ class ImageRecommender:
         out = []
         for iid, sc, det in results:
             meta = self.db.get_image_metadata(iid)
-            out.append({'image_id': iid, 'similarity_score': sc, 'detailed_scores': det, 'metadata': meta})
+            out.append(
+                {"image_id": iid, "similarity_score": sc, "detailed_scores": det, "metadata": meta}
+            )
         return out
 
     def find_similar_images(
-        self,
-        input_image: Union[str, np.ndarray],
-        top_k: int = 5,
-        candidates: int = 200
-    ) -> List[Dict]:
+        self, input_image: Union[str, np.ndarray], top_k: int = 5, candidates: int = 200
+    ) -> list[dict]:
         """Single-query search: extract features → ANN/linear candidates → re-rank."""
         T = {}
         t = time.time()
@@ -500,11 +515,11 @@ class ImageRecommender:
                 raise ValueError(f"Cannot load image: {input_image}")
         else:
             qimg = input_image
-        T['load'] = time.time() - t
+        T["load"] = time.time() - t
 
         t = time.time()
         q_cheap, q_deep, q_cf, q_adv, q_ph = self._query_features(qimg)
-        T['features'] = time.time() - t
+        T["features"] = time.time() - t
 
         # choose index
         use_deep = (len(self.idx_deep.image_ids) > 0) and (q_deep is not None)
@@ -514,7 +529,7 @@ class ImageRecommender:
 
         t = time.time()
         nbrs = idx.knn(q_deep if use_deep else q_cheap, k)
-        T['ann'] = time.time() - t
+        T["ann"] = time.time() - t
         if not nbrs:
             return []
 
@@ -522,11 +537,11 @@ class ImageRecommender:
 
         t = time.time()
         rows = self._bulk_fetch_candidates(cand_ids)
-        T['dbfetch'] = time.time() - t
+        T["dbfetch"] = time.time() - t
 
         t = time.time()
         out = self._rerank(q_cf, q_adv, q_deep, q_ph, rows, top_k)
-        T['rerank'] = time.time() - t
+        T["rerank"] = time.time() - t
 
         log.info(
             f"Search: load={T['load']:.3f}s feat={T['features']:.3f}s ann={T['ann']:.3f}s "
@@ -537,11 +552,11 @@ class ImageRecommender:
 
     def find_similar_multi_input(
         self,
-        input_images: List[Union[str, np.ndarray]],
+        input_images: list[Union[str, np.ndarray]],
         top_k: int = 5,
         candidates: int = 200,
-        combine: str = "mean"
-    ) -> List[Dict]:
+        combine: str = "mean",
+    ) -> list[dict]:
         """Multi-query search: average or max combine of query features/embeddings."""
         if not input_images:
             return []
@@ -582,7 +597,7 @@ class ImageRecommender:
         q_cf = q_cfs[0]
         q_adv = q_advs[0]
         q_ph = q_phs[0]
-        T['features_multi'] = time.time() - t
+        T["features_multi"] = time.time() - t
 
         # choose index
         use_deep = (len(self.idx_deep.image_ids) > 0) and (q_deep is not None)
@@ -592,7 +607,7 @@ class ImageRecommender:
 
         t = time.time()
         nbrs = idx.knn(q_deep if use_deep else q_cheap, k)
-        T['ann'] = time.time() - t
+        T["ann"] = time.time() - t
         if not nbrs:
             return []
 
@@ -600,11 +615,11 @@ class ImageRecommender:
 
         t = time.time()
         rows = self._bulk_fetch_candidates(cand_ids)
-        T['dbfetch'] = time.time() - t
+        T["dbfetch"] = time.time() - t
 
         t = time.time()
         out = self._rerank(q_cf, q_adv, q_deep, q_ph, rows, top_k)
-        T['rerank'] = time.time() - t
+        T["rerank"] = time.time() - t
 
         log.info(
             f"Multi-search: q={len(q_cheaps)} combine={combine} feat={T['features_multi']:.3f}s "
@@ -613,17 +628,19 @@ class ImageRecommender:
         )
         return out
 
-    def get_system_stats(self) -> Dict:
+    def get_system_stats(self) -> dict:
         """Return simple index/weight stats for UI."""
         return {
-            'weights': self.weights,
-            'cheap_index_size': len(self.idx_cheap.image_ids),
-            'deep_index_size': len(self.idx_deep.image_ids)
+            "weights": self.weights,
+            "cheap_index_size": len(self.idx_cheap.image_ids),
+            "deep_index_size": len(self.idx_deep.image_ids),
         }
 
 
 # Convenience bootstrap
-def create_recommender_system(image_directory: str, db_path: str = "image_recommender.db") -> ImageRecommender:
+def create_recommender_system(
+    image_directory: str, db_path: str = "image_recommender.db"
+) -> ImageRecommender:
     """Optional helper: ingest a folder then build the recommender."""
     db = ImageDatabase(db_path)
     if image_directory:
@@ -637,4 +654,6 @@ if __name__ == "__main__":
     if IMAGE_PATH:
         res = rec.find_similar_images(IMAGE_PATH, top_k=5)
         for i, r in enumerate(res, 1):
-            print(f"{i}. {r['metadata'].get('filename','?')} (Score: {r['similarity_score']:.3f})")
+            print(
+                f"{i}. {r['metadata'].get('filename', '?')} (Score: {r['similarity_score']:.3f})"
+            )

@@ -3,22 +3,21 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
+import logging
 import os
 import sqlite3
-import json
-import hashlib
-import datetime
-import logging
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import Any, Optional
 
-import numpy as np
 import cv2
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import numpy as np
 
 from FeatureExtraction import ColorAnalyzer, compute_phash
-
 
 __all__ = ["ImageDatabase"]
 
@@ -33,7 +32,8 @@ JPEG_EXTS = {".jpg", ".jpeg"}
 # ----------------------------- TurboJPEG -------------------------------------
 HAVE_TURBO = False
 try:
-    from turbojpeg import TurboJPEG, TJPF_BGR, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
+    from turbojpeg import TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_BGR, TurboJPEG
+
     HAVE_TURBO = True
 except Exception:
     HAVE_TURBO = False
@@ -41,14 +41,15 @@ except Exception:
 
 class _TLS:
     """Thread-local store for TurboJPEG handle."""
-    turbo: Optional["TurboJPEG"] = None
+
+    turbo: Optional[TurboJPEG] = None
     turbo_init_failed: bool = False
 
 
 TLS = _TLS()
 
 
-def _get_turbo() -> Optional["TurboJPEG"]:
+def _get_turbo() -> Optional[TurboJPEG]:
     """Return (and lazily init) a TurboJPEG handle if available, else None."""
     if not HAVE_TURBO or TLS.turbo_init_failed:
         return None
@@ -59,11 +60,11 @@ def _get_turbo() -> Optional["TurboJPEG"]:
     candidates = [
         os.environ.get("TURBOJPEG"),
         "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",  # macOS (Apple Silicon)
-        "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",     # macOS (Intel)
-        "/opt/local/lib/libturbojpeg.dylib",                    # macOS (MacPorts)
-        "/usr/lib/libturbojpeg.so",                             # Linux
-        "/usr/lib/x86_64-linux-gnu/libturbojpeg.so",            # Linux (Debian/Ubuntu)
-        r"C:\libjpeg-turbo\bin\turbojpeg.dll",                  # Windows
+        "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",  # macOS (Intel)
+        "/opt/local/lib/libturbojpeg.dylib",  # macOS (MacPorts)
+        "/usr/lib/libturbojpeg.so",  # Linux
+        "/usr/lib/x86_64-linux-gnu/libturbojpeg.so",  # Linux (Debian/Ubuntu)
+        r"C:\libjpeg-turbo\bin\turbojpeg.dll",  # Windows
     ]
     try:
         lib = next((p for p in candidates if p and os.path.exists(p)), None)
@@ -150,7 +151,9 @@ def _decode_imdecode(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
         if img is not None and Path(path).suffix.lower() in JPEG_EXTS and jpeg_reduce in (2, 4, 8):
             f = 1.0 / float(jpeg_reduce)
             h, w = img.shape[:2]
-            img = cv2.resize(img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA)
+            img = cv2.resize(
+                img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA
+            )
         return img
     except Exception:
         return None
@@ -168,7 +171,9 @@ def _decode_opencv(path: str, jpeg_reduce: int) -> Optional[np.ndarray]:
         return None
 
 
-def _decode_image(path: str, decode_mode: str, jpeg_reduce: int) -> Tuple[Optional[np.ndarray], str]:
+def _decode_image(
+    path: str, decode_mode: str, jpeg_reduce: int
+) -> tuple[Optional[np.ndarray], str]:
     """Try decoders according to `decode_mode`. Return (BGR image, decoder_used)."""
     # Skip resource forks / junk files
     name = Path(path).name
@@ -213,7 +218,7 @@ def _process_one(
     decode_mode: str,
     jpeg_reduce: int,
     use_file_hash: bool,
-) -> Optional[Tuple[Tuple, Tuple, Tuple, Dict[str, float], str, str]]:
+) -> Optional[tuple[tuple, tuple, tuple, dict[str, float], str, str]]:
     """Worker: decode -> resize -> color features -> pHash. Returns DB rows + stats."""
     t0 = time.time()
     stats = {"io_decode": 0.0, "resize": 0.0, "color": 0.0, "phash": 0.0, "total": 0.0}
@@ -363,13 +368,13 @@ class ImageDatabase:
         self.conn.commit()
 
     # ----------------------------- getters -----------------------------------
-    def get_all_image_ids(self) -> List[str]:
+    def get_all_image_ids(self) -> list[str]:
         """Return all image_ids."""
         c = self.conn.cursor()
         c.execute("SELECT image_id FROM images")
         return [r[0] for r in c.fetchall()]
 
-    def get_image_metadata(self, image_id: str) -> Optional[Dict[str, Any]]:
+    def get_image_metadata(self, image_id: str) -> Optional[dict[str, Any]]:
         """Return metadata row from images table as dict."""
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
@@ -379,7 +384,7 @@ class ImageDatabase:
         con.close()
         return dict(row) if row else None
 
-    def get_color_features(self, image_id: str) -> Optional[Dict[str, Any]]:
+    def get_color_features(self, image_id: str) -> Optional[dict[str, Any]]:
         """Return color features for an image_id as dict."""
         con = sqlite3.connect(self.db_path)
         c = con.cursor()
@@ -398,7 +403,7 @@ class ImageDatabase:
             "color_stats": json.loads(row[3]),
         }
 
-    def get_database_stats(self) -> Dict[str, Any]:
+    def get_database_stats(self) -> dict[str, Any]:
         """Return counts & DB file size (MB)."""
         c = self.conn.cursor()
         c.execute("SELECT COUNT(*) FROM images")
@@ -430,7 +435,7 @@ class ImageDatabase:
         jpeg_reduce: int = 8,
         use_file_hash: bool = False,
         log_every: int = 500,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Bulk ingest a directory of images with parallel decode + feature extraction."""
         root = Path(directory)
         if not root.exists():
@@ -439,7 +444,7 @@ class ImageDatabase:
 
         # Collect files (skip resource forks)
         it = root.rglob("*") if recursive else root.iterdir()
-        files: List[str] = []
+        files: list[str] = []
         for p in it:
             if not p.is_file():
                 continue
@@ -498,9 +503,9 @@ class ImageDatabase:
         t0 = time.time()
         cur = self.conn.cursor()
         cur.execute("BEGIN")
-        buf_img: List[Tuple] = []
-        buf_color: List[Tuple] = []
-        buf_adv: List[Tuple] = []
+        buf_img: list[tuple] = []
+        buf_color: list[tuple] = []
+        buf_adv: list[tuple] = []
 
         Executor = ThreadPoolExecutor if pool == "thread" else ProcessPoolExecutor
         init = None if pool == "thread" else _init_worker
@@ -560,7 +565,9 @@ class ImageDatabase:
                         eta_s = remaining / max(1e-6, imgs_s)
                         eta_str = _fmt_dur(eta_s)
                         elapsed_str = _fmt_dur(elapsed_total)
-                        eta_clock = (datetime.datetime.now() + datetime.timedelta(seconds=eta_s)).strftime("%H:%M:%S")
+                        eta_clock = (
+                            datetime.datetime.now() + datetime.timedelta(seconds=eta_s)
+                        ).strftime("%H:%M:%S")
 
                         ms = {k: (acc[k] / max(1, nstat)) * 1000.0 for k in acc}
                         log.info(
@@ -624,7 +631,7 @@ class ImageDatabase:
         }
 
     # -------------------- embeddings API (used by backfill) -------------------
-    def save_deep_embeddings(self, rows: List[Tuple[str, bytes, int]]) -> None:
+    def save_deep_embeddings(self, rows: list[tuple[str, bytes, int]]) -> None:
         """Upsert deep embeddings as BLOBs (image_id, blob, dim)."""
         cur = self.conn.cursor()
         cur.executemany(
@@ -644,18 +651,42 @@ class ImageDatabase:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Fast bulk ingest of images into SQLite (features+pHash).")
+    ap = argparse.ArgumentParser(
+        description="Fast bulk ingest of images into SQLite (features+pHash)."
+    )
     ap.add_argument("--ingest", type=str, required=True, help="Root directory (recursive).")
     ap.add_argument("--db", type=str, default="image_recommender.db", help="SQLite DB path.")
-    ap.add_argument("--workers", type=int, default=None, help="Number of workers (auto if omitted).")
-    ap.add_argument("--pool", type=str, choices=["thread", "process"], default="thread", help="Thread vs process pool.")
-    ap.add_argument("--decode-mode", type=str, choices=["auto", "turbo", "imdecode", "opencv"], default="auto")
-    ap.add_argument("--jpeg-reduce", type=int, choices=[1, 2, 4, 8], default=8, help="Turbo/OpenCV reduced decode factor.")
-    ap.add_argument("--batch-size", type=int, default=2000, help="DB batch size for executemany().")
+    ap.add_argument(
+        "--workers", type=int, default=None, help="Number of workers (auto if omitted)."
+    )
+    ap.add_argument(
+        "--pool",
+        type=str,
+        choices=["thread", "process"],
+        default="thread",
+        help="Thread vs process pool.",
+    )
+    ap.add_argument(
+        "--decode-mode", type=str, choices=["auto", "turbo", "imdecode", "opencv"], default="auto"
+    )
+    ap.add_argument(
+        "--jpeg-reduce",
+        type=int,
+        choices=[1, 2, 4, 8],
+        default=8,
+        help="Turbo/OpenCV reduced decode factor.",
+    )
+    ap.add_argument(
+        "--batch-size", type=int, default=2000, help="DB batch size for executemany()."
+    )
     ap.add_argument("--bins", type=int, default=32, help="Histogram bins per channel.")
     ap.add_argument("--k", type=int, default=3, help="Number of dominant colors (k-means).")
-    ap.add_argument("--resize", type=int, default=256, help="Max side for feature extraction (pixels).")
-    ap.add_argument("--use-file-hash", action="store_true", help="Compute MD5 of file contents (slower).")
+    ap.add_argument(
+        "--resize", type=int, default=256, help="Max side for feature extraction (pixels)."
+    )
+    ap.add_argument(
+        "--use-file-hash", action="store_true", help="Compute MD5 of file contents (slower)."
+    )
     ap.add_argument("--log-every", type=int, default=1000, help="Progress log interval (#images).")
     args = ap.parse_args()
 

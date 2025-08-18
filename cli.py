@@ -13,44 +13,58 @@ Notes:
   and logs throughput + ETA.
 """
 
-import argparse, json, sys, math, time, os, sqlite3
-from pathlib import Path
-from typing import Iterable, List, Dict, Any, Optional, Tuple
-
+import argparse
 import datetime
-import numpy as np
-import cv2
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Optional
 
+import cv2
+import numpy as np
+
+from DeepEmbedding import VisionEmbedder
 from ImageDatabase import ImageDatabase
 from ImageRecommender import ImageRecommender
-from DeepEmbedding import VisionEmbedder
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 # Optional TurboJPEG (fast JPEG decode & 1/2,1/4,1/8 scaling)
 try:
-    from turbojpeg import TurboJPEG, TJPF_BGR, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
+    from turbojpeg import TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_BGR, TurboJPEG
+
     _TJ = TurboJPEG(os.environ.get("TURBOJPEG")) if os.environ.get("TURBOJPEG") else TurboJPEG()
 except Exception:
     _TJ = None
 
 # ---------------- helpers ----------------
 
+
 def iter_images(root: Path) -> Iterable[Path]:
     """Yield images under a directory (recursively), or the file itself if it's an image."""
     if root.is_file() and root.suffix.lower() in SUPPORTED_EXTS:  # single file
-        yield root; return
+        yield root
+        return
     if root.is_dir():
         for p in root.rglob("*"):
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
                 yield p
 
-def _safe_path_from_result(r: Dict[str, Any]) -> str:
+
+def _safe_path_from_result(r: dict[str, Any]) -> str:
     meta = r.get("metadata") or {}
     return meta.get("filepath") or meta.get("path") or ""
 
-def _show_grid(title: str, images: List[Path], titles: List[str], out_path: Optional[str], show: bool) -> None:
+
+def _show_grid(
+    title: str, images: list[Path], titles: list[str], out_path: Optional[str], show: bool
+) -> None:
     """Render a simple grid using matplotlib (optional)."""
     try:
         import matplotlib.pyplot as plt
@@ -61,16 +75,19 @@ def _show_grid(title: str, images: List[Path], titles: List[str], out_path: Opti
     loaded = []
     for p in images:
         if not p:
-            loaded.append(None); continue
+            loaded.append(None)
+            continue
         img = cv2.imread(str(p))
         if img is None:
-            loaded.append(None); continue
+            loaded.append(None)
+            continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         loaded.append(img)
 
     n = len(loaded)
     if n == 0:
-        print("[INFO] Nothing to display."); return
+        print("[INFO] Nothing to display.")
+        return
     cols = min(3, max(1, n))
     rows = math.ceil(n / cols)
 
@@ -81,7 +98,8 @@ def _show_grid(title: str, images: List[Path], titles: List[str], out_path: Opti
             ax = plt.subplot(rows, cols, i)
             if img is not None:
                 ax.imshow(img)
-            ax.set_title(t); ax.axis("off")
+            ax.set_title(t)
+            ax.axis("off")
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         if out_path:
             plt.savefig(out_path, dpi=150)
@@ -92,13 +110,16 @@ def _show_grid(title: str, images: List[Path], titles: List[str], out_path: Opti
     except Exception as e:
         print(f"[WARN] Could not display/save grid: {e}", file=sys.stderr)
 
-def _normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
+
+def _normalize_weights(w: dict[str, float]) -> dict[str, float]:
     s = sum(max(0.0, v) for v in w.values())
     if s <= 0:
         return {"color": 0.0, "embedding": 1.0, "custom": 0.0}
     return {k: float(max(0.0, v)) / s for k, v in w.items()}
 
+
 # --------------- ONE-SHOT BACKFILL helpers ---------------
+
 
 def _read_bytes(path: str) -> Optional[bytes]:
     try:
@@ -106,6 +127,7 @@ def _read_bytes(path: str) -> Optional[bytes]:
             return f.read()
     except Exception:
         return None
+
 
 def _decode_one(path: str, decode_mode: str, jpeg_reduce: int) -> Optional[np.ndarray]:
     """Decode file -> BGR np.ndarray (uses TurboJPEG if available)."""
@@ -116,10 +138,12 @@ def _decode_one(path: str, decode_mode: str, jpeg_reduce: int) -> Optional[np.nd
         data = _read_bytes(path)
         if data is not None:
             try:
-                sf = {1:(1,1), 2:(1,2), 4:(1,4), 8:(1,8)}.get(int(jpeg_reduce), (1,8))
+                sf = {1: (1, 1), 2: (1, 2), 4: (1, 4), 8: (1, 8)}.get(int(jpeg_reduce), (1, 8))
                 return _TJ.decode(
-                    data, pixel_format=TJPF_BGR, scaling_factor=sf,
-                    flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT
+                    data,
+                    pixel_format=TJPF_BGR,
+                    scaling_factor=sf,
+                    flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT,
                 )
             except Exception:
                 pass
@@ -132,8 +156,11 @@ def _decode_one(path: str, decode_mode: str, jpeg_reduce: int) -> Optional[np.nd
     if img is not None and ext in (".jpg", ".jpeg") and jpeg_reduce in (2, 4, 8):
         f = 1.0 / float(jpeg_reduce)
         h, w = img.shape[:2]
-        img = cv2.resize(img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA)
+        img = cv2.resize(
+            img, (max(1, int(w * f)), max(1, int(h * f))), interpolation=cv2.INTER_AREA
+        )
     return img
+
 
 def _fmt_hms(sec: float) -> str:
     """Format seconds → HH:MM:SS."""
@@ -142,7 +169,8 @@ def _fmt_hms(sec: float) -> str:
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def _iter_missing_embeddings(db_path: str, limit: Optional[int] = None) -> List[Tuple[str, str]]:
+
+def _iter_missing_embeddings(db_path: str, limit: Optional[int] = None) -> list[tuple[str, str]]:
     con = sqlite3.connect(db_path)
     cur = con.cursor()
     q = """
@@ -157,26 +185,33 @@ def _iter_missing_embeddings(db_path: str, limit: Optional[int] = None) -> List[
     con.close()
     return [(r[0], r[1]) for r in rows]
 
-def _save_embedding_rows(db_path: str, rows: List[Tuple[str, memoryview, int]]) -> None:
+
+def _save_embedding_rows(db_path: str, rows: list[tuple[str, memoryview, int]]) -> None:
     con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.executemany("""
+    cur.executemany(
+        """
       INSERT INTO advanced_features (image_id, texture_features, deep_embeddings, custom_features, deep_dim)
       VALUES (?, NULL, ?, NULL, ?)
       ON CONFLICT(image_id) DO UPDATE SET
         deep_embeddings=excluded.deep_embeddings,
         deep_dim=excluded.deep_dim
-    """, rows)
+    """,
+        rows,
+    )
     con.commit()
     con.close()
 
+
 # ---------------- commands ----------------
+
 
 def cmd_ingest(args: argparse.Namespace) -> None:
     """Index images into SQLite (features)."""
     root = Path(args.images).expanduser().resolve()
     if not root.exists():
-        print(f"[ERROR] Path not found: {root}", file=sys.stderr); sys.exit(1)
+        print(f"[ERROR] Path not found: {root}", file=sys.stderr)
+        sys.exit(1)
     db = ImageDatabase(db_path=args.db)
     added, errors = 0, 0
     t0 = time.time()
@@ -189,16 +224,22 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             print(f"[WARN] Could not ingest {img_path}: {e}", file=sys.stderr)
     elapsed = time.time() - t0
     stats = db.get_database_stats() if hasattr(db, "get_database_stats") else {}
-    print(json.dumps({"added": added, "errors": errors, "elapsed_sec": round(elapsed, 2), "stats": stats},
-                     indent=2, ensure_ascii=False))
+    print(
+        json.dumps(
+            {"added": added, "errors": errors, "elapsed_sec": round(elapsed, 2), "stats": stats},
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
 
 def cmd_query(args: argparse.Namespace) -> None:
     """Top-k search for a single query image."""
     db = ImageDatabase(db_path=args.db)
     rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold)
-    rec.weights = _normalize_weights({
-        "color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom
-    })
+    rec.weights = _normalize_weights(
+        {"color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom}
+    )
     t0 = time.time()
     results = rec.find_similar_images(args.image, top_k=args.topk, candidates=args.candidates)
     elapsed = time.time() - t0
@@ -206,17 +247,20 @@ def cmd_query(args: argparse.Namespace) -> None:
     print(json.dumps(results, indent=2, ensure_ascii=False))
     if args.show or args.save_grid:
         paths = [Path(args.image)] + [Path(_safe_path_from_result(r)) for r in results]
-        titles = ["QUERY"] + [f"{(r.get('metadata') or {}).get('filename','?')} ({r.get('similarity_score',0):.2f})"
-                              for r in results]
+        titles = ["QUERY"] + [
+            f"{(r.get('metadata') or {}).get('filename', '?')} ({r.get('similarity_score', 0):.2f})"
+            for r in results
+        ]
         _show_grid("Query & Top-k Results", paths, titles, args.save_grid, args.show)
+
 
 def cmd_query_multi(args: argparse.Namespace) -> None:
     """Top-k search for multiple query images (score fusion)."""
     db = ImageDatabase(db_path=args.db)
     rec = ImageRecommender(database=db, ann_threshold=args.ann_threshold)
-    rec.weights = _normalize_weights({
-        "color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom
-    })
+    rec.weights = _normalize_weights(
+        {"color": args.w_color, "embedding": args.w_embedding, "custom": args.w_custom}
+    )
     t0 = time.time()
     results = rec.find_similar_multi_input(
         args.images, top_k=args.topk, candidates=args.candidates, combination_method="average"
@@ -228,18 +272,18 @@ def cmd_query_multi(args: argparse.Namespace) -> None:
         query_paths = [Path(p) for p in args.images]
         result_paths = [Path(_safe_path_from_result(r)) for r in results]
         paths = query_paths + result_paths
-        titles = [f"QUERY {i+1}" for i in range(len(args.images))] + [
-            f"{(r.get('metadata') or {}).get('filename','?')} ({r.get('similarity_score',0):.2f})"
+        titles = [f"QUERY {i + 1}" for i in range(len(args.images))] + [
+            f"{(r.get('metadata') or {}).get('filename', '?')} ({r.get('similarity_score', 0):.2f})"
             for r in results
         ]
         _show_grid("Multi-Query & Top-k Results", paths, titles, args.save_grid, args.show)
+
 
 def cmd_stats(args: argparse.Namespace) -> None:
     """Print DB stats."""
     db = ImageDatabase(db_path=args.db)
     stats = db.get_database_stats() if hasattr(db, "get_database_stats") else {}
     print(json.dumps(stats, indent=2, ensure_ascii=False))
-
 
 
 def cmd_backfill(args: argparse.Namespace) -> None:
@@ -257,7 +301,8 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     cur.execute("PRAGMA temp_store=MEMORY;")
     cur.execute("PRAGMA mmap_size=3000000000;")
     cur.execute("PRAGMA cache_size=-200000;")
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
     todo = _iter_missing_embeddings(args.db, args.limit)
     N = len(todo)
@@ -265,8 +310,10 @@ def cmd_backfill(args: argparse.Namespace) -> None:
         print("[INFO] No missing embeddings. Done.")
         return
 
-    print(f"[INFO] Backfill once: N={N} | batch={args.batch} | io_workers={args.io_workers} | "
-          f"decode={args.decode_mode} | jpeg_reduce={args.jpeg_reduce}")
+    print(
+        f"[INFO] Backfill once: N={N} | batch={args.batch} | io_workers={args.io_workers} | "
+        f"decode={args.decode_mode} | jpeg_reduce={args.jpeg_reduce}"
+    )
 
     emb = VisionEmbedder(model_name="mobilenet_v3_large", proj_dim=128, seed=42)
     if not emb.available():
@@ -291,23 +338,27 @@ def cmd_backfill(args: argparse.Namespace) -> None:
             rate_chunk = since_items / max(1e-6, since_s) if since_s > 0 else 0.0
             remain = N - saved
             eta_s = int(remain / max(1e-6, rate_global)) if saved > 0 else 0
-            eta_clock = (datetime.datetime.now() + datetime.timedelta(seconds=eta_s)).strftime("%H:%M:%S")
+            eta_clock = (datetime.datetime.now() + datetime.timedelta(seconds=eta_s)).strftime(
+                "%H:%M:%S"
+            )
             print(
                 f"... {saved}/{N} | {rate_global:.1f} imgs/s (global), {rate_chunk:.1f} (chunk) | "
                 f"elapsed {_fmt_hms(elapsed)} | ETA {_fmt_hms(eta_s)} (~{eta_clock})",
-                flush=True
+                flush=True,
             )
             last_log_ts = now
             last_log_saved = saved
 
     for ci in range(0, N, chunk_size):
-        chunk = todo[ci:ci+chunk_size]
+        chunk = todo[ci : ci + chunk_size]
 
         # parallel decode
         imgs = [None] * len(chunk)
         with ThreadPoolExecutor(max_workers=args.io_workers) as ex:
-            futs = {ex.submit(_decode_one, p, args.decode_mode, args.jpeg_reduce): j
-                    for j, (_, p) in enumerate(chunk)}
+            futs = {
+                ex.submit(_decode_one, p, args.decode_mode, args.jpeg_reduce): j
+                for j, (_, p) in enumerate(chunk)
+            }
             for fut in as_completed(futs):
                 j = futs[fut]
                 try:
@@ -316,10 +367,10 @@ def cmd_backfill(args: argparse.Namespace) -> None:
                     imgs[j] = None
 
         # embed & save in mini-batches
-        rows: List[Tuple[str, memoryview, int]] = []
+        rows: list[tuple[str, memoryview, int]] = []
         for bi in range(0, len(chunk), args.batch):
-            sub = chunk[bi:bi+args.batch]
-            sub_imgs = imgs[bi:bi+args.batch]
+            sub = chunk[bi : bi + args.batch]
+            sub_imgs = imgs[bi : bi + args.batch]
             valid = [(k, im) for k, im in enumerate(sub_imgs) if im is not None]
             if not valid:
                 _maybe_log()  # trotzdem periodisch loggen
@@ -329,7 +380,11 @@ def cmd_backfill(args: argparse.Namespace) -> None:
             Z = emb.embed_batch(list(imgs_valid))
 
             # Safe emptiness check for list/tuple OR numpy array
-            if Z is None or (hasattr(Z, "size") and Z.size == 0) or (hasattr(Z, "__len__") and len(Z) == 0):
+            if (
+                Z is None
+                or (hasattr(Z, "size") and Z.size == 0)
+                or (hasattr(Z, "__len__") and len(Z) == 0)
+            ):
                 continue
 
             for off, zi in zip(idx_local, Z):
@@ -352,12 +407,15 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     # final log
     _maybe_log(force=True)
     elapsed = time.time() - start_ts
-    print(f"[DONE] {saved}/{N} in {_fmt_hms(elapsed)} ({saved/max(1e-6,elapsed):.1f} imgs/s)")
+    print(f"[DONE] {saved}/{N} in {_fmt_hms(elapsed)} ({saved / max(1e-6, elapsed):.1f} imgs/s)")
 
     # housekeeping
     os.system(f"sqlite3 {args.db} 'PRAGMA wal_checkpoint(TRUNCATE);'")
     os.system(f"sqlite3 {args.db} 'PRAGMA optimize;'")
+
+
 # ---------------- parser ----------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="cli.py", description="Image Recommender CLI")
@@ -373,7 +431,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("query", help="Search with one query image")
     sp.add_argument("--image", required=True)
     sp.add_argument("--topk", type=int, default=5)
-    sp.add_argument("--candidates", type=int, default=200, help="Candidate pool size (for re-ranking)")
+    sp.add_argument(
+        "--candidates", type=int, default=200, help="Candidate pool size (for re-ranking)"
+    )
     sp.add_argument("--db", default="image_recommender.db")
     sp.add_argument("--ann-threshold", type=int, default=1000)
     sp.add_argument("--w-color", type=float, default=0.3)
@@ -407,19 +467,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--db", default="image_recommender.db")
     sp.add_argument("--batch", type=int, default=320)
     sp.add_argument("--io-workers", type=int, default=24)
-    sp.add_argument("--decode-mode", choices=["auto","turbo","imdecode","opencv"], default="auto")
-    sp.add_argument("--jpeg-reduce", type=int, choices=[1,2,4,8], default=8)
-    sp.add_argument("--limit", type=int, default=None, help="Process at most N images (for testing)")
+    sp.add_argument(
+        "--decode-mode", choices=["auto", "turbo", "imdecode", "opencv"], default="auto"
+    )
+    sp.add_argument("--jpeg-reduce", type=int, choices=[1, 2, 4, 8], default=8)
+    sp.add_argument(
+        "--limit", type=int, default=None, help="Process at most N images (for testing)"
+    )
     sp.add_argument("--log-every", type=int, default=2000, help="Commit+log every N vectors")
     sp.add_argument("--log-seconds", type=float, default=30.0, help="Also log every S seconds")
     sp.set_defaults(func=cmd_backfill)
 
     return ap
 
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)
+
 
 if __name__ == "__main__":
     main()
