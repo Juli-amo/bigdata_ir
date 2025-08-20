@@ -1,0 +1,30 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 99
+exclude = [
+  ".venv",
+  "build",
+  "dist",
+  "plots",
+  "data",
+  "dataset",
+  "images",
+  "*.ipynb",
+  "image_recommender.db*",
+]
+
+[tool.ruff.lint]
+# Nur wichtige, sichere Regelsammlungen:
+# F: Pyflakes (Fehler), E/W: pycodestyle, I: import-sort, UP: pyupgrade
+select = ["F", "E", "W", "I", "UP"]
+
+# Formatter (ruff format) kümmert sich um Stil; diese Konflikte ignorieren:
+ignore = [
+  "E203",  # whitespace before ':'
+  "E501",  # long lines (Formatter übernimmt)
+  "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+"__init__.py" = ["F401"]  # erlaubte re-exports

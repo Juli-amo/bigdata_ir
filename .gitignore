@@ -1,80 +1,88 @@
-# Python Bytecode Files
+# ----------------------
+# Python / Virtualenv
+# ----------------------
 __pycache__/
 *.py[cod]
-*$py.class
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.cache/
 
-# C/C++ compiled files
-*.so
+# ----------------------
+# Editors / IDEs
+# ----------------------
+.vscode/
+.idea/
 
-# Distribution / packaging
+# ----------------------
+# Notebooks
+# ----------------------
+.ipynb_checkpoints/
+
+# ----------------------
+# Build / Dist / Logs
+# ----------------------
 build/
 dist/
-*.egg-info/
-.eggs/
-sdist/
-develop-eggs/
-*.egg
-MANIFEST
+*.log
+logs/
 
-# Virtual environments
-.venv/
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Installer logs and local caches
-pip-log.txt
-pip-delete-this-directory.txt
-.cache/
-.coverage
-
-# Unit test / coverage results
+# ----------------------
+# Tests / Coverage
+# ----------------------
+.pytest_cache/
+.coverage*
 htmlcov/
 .tox/
 .nox/
-pytest_cache/
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# IDE and editor directories
-.idea/
-.vscode/
-*.code-workspace
-.spyproject
-.ropeproject
-
-# Local configuration
-*.env
-*.env.*
-
-# System-specific files
-.DS_Store
-.AppleDouble
-.LSOverride
-
-# Thumbnails and temporary files
-._*
-Thumbs.db
-Desktop.ini
-
-# Data files (large datasets, model checkpoints)
-*.npy
-*.npz
-*.h5
-*.pkl
-*.pickle
+# ----------------------
+# Data / DB / Arrays
+# (DB + große Binärfiles nicht einchecken)
+# ----------------------
+image_recommender.db
 *.db
-*.sqlite
-*.pt
-*.ckpt
-dataset/
-data/
-images/
-Bilder/
-old/
+*.db-*
+*.sqlite*
+*.npz
+*.npy
 
-# Ignore generated documentation
-docs/_build/
+# ggf. gesamte Datensätze ignorieren
+data/
+dataset/
+images/
+
+# optional: erlaubte Mini-Samples (klein halten!)
+!samples/**
+# (falls du samples nicht willst, entferne die Zeile oben)
+
+# ----------------------
+# Plots / Outputs
+# ----------------------
+plots/
+
+# ----------------------
+# Streamlit / Secrets
+# ----------------------
+.streamlit/secrets.toml
+
+# ----------------------
+# LaTeX Builds
+# ----------------------
+*.aux
+*.bbl
+*.blg
+*.lof
+*.log
+*.lot
+*.out
+*.toc
+*.synctex.gz
+
+# ----------------------
+# OS
+# ----------------------
+.DS_Store
+Thumbs.db
